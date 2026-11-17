@@ -9,6 +9,13 @@
 4. Label/select a node suitable for local-path persistence if the cluster has
    multiple nodes.
 5. Establish backups to storage physically separate from both local PVCs.
+6. Create the application configuration Secret before starting the Deployment:
+
+   ```bash
+   kubectl -n type-safety-history create secret generic type-safety-history-config \
+     --from-literal=curator-token='<long-random-token>' \
+     --from-literal=crossref-mailto='<monitored-research-email>'
+   ```
 
 Apply `db/` first and wait for the CNPG cluster to become ready. Then apply
 `deploy/`. Both Kustomizations include the same idempotent Namespace definition.

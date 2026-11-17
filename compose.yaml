@@ -29,6 +29,8 @@ services:
       DATABASE_URL: postgresql://type_safety_history:type_safety_history@postgres:5432/type_safety_history
       DATA_ROOT: /data
       RUST_LOG: type_safety_history_api=info,tower_http=info
+      CURATOR_TOKEN: ${CURATOR_TOKEN:?set CURATOR_TOKEN in .env}
+      CROSSREF_MAILTO: ${CROSSREF_MAILTO:?set CROSSREF_MAILTO in .env}
     ports:
       - "8080:8080"
     volumes:

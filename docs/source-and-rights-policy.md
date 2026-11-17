@@ -32,6 +32,28 @@ sites are never sufficient evidence by themselves.
 Every adapter must document its allowed endpoints, fields, rate limits,
 retention, redistribution rules and terms URL before it is enabled.
 
+## Enabled adapter: Crossref REST API v1
+
+- Endpoint: one-record lookup at `https://api.crossref.org/v1/works/{doi}`.
+- Identification: required `CROSSREF_MAILTO` query parameter plus an identifying
+  user-agent. Anonymous operation is intentionally unsupported.
+- Concurrency: lookups are serialized in-process and locally limited to four
+  requests per second, below Crossref's documented public single-record limit.
+  Each curator call can import only one DOI.
+- Caching: a normalized DOI is returned from the local database unless the
+  curator explicitly requests a refresh.
+- Backoff: HTTP 429 is surfaced as a retryable service-unavailable response; the
+  application does not immediately retry it.
+- Retained fields: DOI, title, work type, publication year, authors, publisher,
+  container title, canonical URL and deposited licence metadata.
+- Excluded fields: abstracts, full text and TDM links. Crossref notes that
+  deposited abstracts may remain copyrighted, and a TDM link does not establish
+  access permission at the publisher.
+- Reliability: authoritative bibliographic metadata, not primary evidence for
+  the contents or priority of a theorem.
+- Terms/documentation URL:
+  `https://www.crossref.org/documentation/retrieve-metadata/rest-api/`.
+
 ## Local ML
 
 No document content or embedding is sent to a hosted inference or OCR service.

@@ -47,6 +47,10 @@ spec:
           env:
             - { name: DATA_ROOT, value: /data }
             - { name: RUST_LOG, value: type_safety_history_api=info,tower_http=info }
+            - name: CURATOR_TOKEN
+              valueFrom: { secretKeyRef: { name: type-safety-history-config, key: curator-token } }
+            - name: CROSSREF_MAILTO
+              valueFrom: { secretKeyRef: { name: type-safety-history-config, key: crossref-mailto } }
             - name: DATABASE_URL
               valueFrom: { secretKeyRef: { name: type-safety-history-db-app, key: uri } }
           volumeMounts:

@@ -1,3 +1,4 @@
+mod crossref;
 mod routes;
 
 use std::{
@@ -19,6 +20,8 @@ use tracing::info;
 pub(crate) struct AppState {
     pub db: PgPool,
     pub data_root: Arc<PathBuf>,
+    pub curator_token: Option<Arc<str>>,
+    pub crossref: Option<crossref::CrossrefClient>,
 }
 
 #[tokio::main]
@@ -45,9 +48,24 @@ async fn main() -> Result<()> {
         .await
         .context("run database migrations")?;
 
+    let curator_token = env::var("CURATOR_TOKEN")
+        .ok()
+        .filter(|token| !token.trim().is_empty())
+        .map(Arc::<str>::from);
+    let crossref = match env::var("CROSSREF_MAILTO") {
+        Ok(mailto) if !mailto.trim().is_empty() => Some(crossref::CrossrefClient::new(
+            mailto,
+            env::var("CROSSREF_USER_AGENT").unwrap_or_else(|_| {
+                "type-safety-history/0.1 (+https://example.invalid/type-safety-history)".into()
+            }),
+        )?),
+        _ => None,
+    };
     let state = AppState {
         db,
         data_root: Arc::new(data_root),
+        curator_token,
+        crossref,
     };
     let app = Router::new()
         .merge(routes::router())

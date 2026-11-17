@@ -13,6 +13,8 @@ not as a claim. Machine-generated results are candidates until reviewed.
 Requirements: Docker with Compose.
 
 ```bash
+cp .env.example .env
+# Set a real research contact email and a long random curator token in .env.
 docker compose up --build
 curl http://localhost:8080/health/ready
 ```
@@ -40,6 +42,22 @@ kubectl apply -k deploy
 
 Set the real image names and public hostname before deployment. See
 [`docs/operations.md`](docs/operations.md).
+
+## Crossref DOI import
+
+Imports require curator authentication and a configured Crossref contact email.
+The adapter uses Crossref's versioned REST endpoint and polite-pool etiquette,
+caches selected bibliographic metadata, and deliberately excludes abstracts and
+full text.
+
+```bash
+curl -X POST http://localhost:8080/api/v1/imports/crossref \
+  -H "Authorization: Bearer $CURATOR_TOKEN" \
+  -H 'Content-Type: application/json' \
+  --data '{"doi":"10.1006/inco.1994.1093"}'
+```
+
+The initial DOI queue is in [`fixtures/seed-works.json`](fixtures/seed-works.json).
 
 ## Policies
 
