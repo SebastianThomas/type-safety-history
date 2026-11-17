@@ -6,6 +6,7 @@ import logging
 import os
 import socket
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 from uuid import UUID
@@ -16,6 +17,25 @@ from psycopg.rows import dict_row
 
 LOG = logging.getLogger("type_safety_ml.worker")
 LEASE_SECONDS = 300
+PIPELINE_VERSION = "local-term-baseline-v1"
+MAX_CANDIDATES_PER_DOCUMENT = 25
+
+
+@dataclass(frozen=True)
+class Candidate:
+    page: int
+    result_kind: str
+    char_start: int
+    char_end: int
+    content_sha256: str
+    matched_terms: tuple[str, ...]
+    candidate_key: str
+
+
+@dataclass(frozen=True)
+class ProcessedDocument:
+    result: dict[str, Any]
+    candidates: tuple[Candidate, ...]
 
 
 def safe_object_path(data_root: Path, object_key: str) -> Path:
@@ -28,7 +48,7 @@ def safe_object_path(data_root: Path, object_key: str) -> Path:
     return candidate
 
 
-def extract_pdf(path: Path, derived_root: Path, document_id: UUID) -> dict[str, Any]:
+def extract_pdf(path: Path, derived_root: Path, document_id: UUID) -> ProcessedDocument:
     pages: list[dict[str, Any]] = []
     with pymupdf.open(path) as document:
         if document.needs_pass:
@@ -49,11 +69,60 @@ def extract_pdf(path: Path, derived_root: Path, document_id: UUID) -> dict[str, 
     destination = output_dir / f"extracted-{digest}.json"
     temporary.write_bytes(encoded)
     temporary.replace(destination)
-    return {
-        "derived_object_key": str(destination.relative_to(derived_root.parent)),
-        "sha256": digest,
-        "page_count": len(pages),
-    }
+    candidates = classify_pages(document_id, pages)
+    return ProcessedDocument(
+        result={
+            "derived_object_key": str(destination.relative_to(derived_root.parent)),
+            "sha256": digest,
+            "page_count": len(pages),
+            "candidate_count": len(candidates),
+            "pipeline_version": PIPELINE_VERSION,
+        },
+        candidates=tuple(candidates),
+    )
+
+
+def classify_pages(document_id: UUID, pages: list[dict[str, Any]]) -> list[Candidate]:
+    candidates: list[Candidate] = []
+    patterns = (
+        ("progress_and_preservation", ("progress", "preservation")),
+        ("preservation", ("subject reduction",)),
+        ("type_soundness", ("type soundness",)),
+        ("type_soundness", ("well-typed", "go wrong")),
+        ("preservation", ("preservation",)),
+        ("progress", ("progress",)),
+    )
+    for page in pages:
+        text = str(page["text"])
+        lowered = text.casefold()
+        emitted: set[str] = set()
+        for result_kind, terms in patterns:
+            if result_kind in emitted or not all(term in lowered for term in terms):
+                continue
+            offsets = [lowered.index(term) for term in terms]
+            char_start = min(offsets)
+            char_end = min(len(text), max(offsets[index] + len(term) for index, term in enumerate(terms)))
+            content_sha256 = hashlib.sha256(text.encode("utf-8")).hexdigest()
+            key_material = (
+                f"{document_id}:{page['page']}:{result_kind}:{content_sha256}:{PIPELINE_VERSION}"
+            )
+            candidates.append(
+                Candidate(
+                    page=int(page["page"]),
+                    result_kind=result_kind,
+                    char_start=char_start,
+                    char_end=char_end,
+                    content_sha256=content_sha256,
+                    matched_terms=terms,
+                    candidate_key=hashlib.sha256(key_material.encode("utf-8")).hexdigest(),
+                )
+            )
+            emitted.add(result_kind)
+            if result_kind == "progress_and_preservation":
+                emitted.update(("progress", "preservation"))
+            if len(candidates) >= MAX_CANDIDATES_PER_DOCUMENT:
+                return candidates
+    return candidates
 
 
 def claim_job(connection: psycopg.Connection[Any], worker_id: str) -> dict[str, Any] | None:
@@ -87,15 +156,114 @@ def claim_job(connection: psycopg.Connection[Any], worker_id: str) -> dict[str, 
         return job
 
 
-def complete_job(connection: psycopg.Connection[Any], job_id: UUID, result: dict[str, Any]) -> None:
-    with connection.transaction():
-        connection.execute(
+def persist_success(
+    connection: psycopg.Connection[Any],
+    job_id: UUID,
+    document_id: UUID,
+    processed: ProcessedDocument,
+) -> None:
+    with connection.transaction(), connection.cursor(row_factory=dict_row) as cursor:
+        cursor.execute(
+            "SELECT work_id FROM documents WHERE id = %s AND ml_use_permitted = true",
+            (document_id,),
+        )
+        document = cursor.fetchone()
+        if document is None:
+            raise ValueError("document is missing or no longer permits ML processing")
+        cursor.execute(
+            """
+            INSERT INTO pipeline_runs
+                (pipeline_name, pipeline_version, configuration)
+            VALUES ('local-proof-candidate-extraction', %s, %s)
+            RETURNING id
+            """,
+            (PIPELINE_VERSION, json.dumps({"kind": "deterministic_term_baseline"})),
+        )
+        pipeline_run_id = cursor.fetchone()["id"]
+        for candidate in processed.candidates:
+            summary = (
+                f"Page contains terminology associated with {candidate.result_kind.replace('_', ' ')}; "
+                "curator verification is required."
+            )
+            cursor.execute(
+                """
+                INSERT INTO proof_results
+                    (work_id, result_kind, statement_summary, source_document_id,
+                     pipeline_run_id, candidate_key)
+                VALUES (%s, %s, %s, %s, %s, %s)
+                ON CONFLICT (candidate_key) DO NOTHING
+                RETURNING id
+                """,
+                (
+                    document["work_id"],
+                    candidate.result_kind,
+                    summary,
+                    document_id,
+                    pipeline_run_id,
+                    candidate.candidate_key,
+                ),
+            )
+            inserted = cursor.fetchone()
+            if inserted is None:
+                continue
+            proof_result_id = inserted["id"]
+            cursor.execute(
+                """
+                INSERT INTO document_spans
+                    (document_id, page_start, page_end, section_path, char_start,
+                     char_end, content_sha256)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                RETURNING id
+                """,
+                (
+                    document_id,
+                    candidate.page,
+                    candidate.page,
+                    f"page:{candidate.page}",
+                    candidate.char_start,
+                    candidate.char_end,
+                    candidate.content_sha256,
+                ),
+            )
+            span_id = cursor.fetchone()["id"]
+            cursor.execute(
+                """
+                INSERT INTO evidence
+                    (proof_result_id, document_span_id, paraphrase, created_by)
+                VALUES (%s, %s, %s, %s)
+                """,
+                (
+                    proof_result_id,
+                    span_id,
+                    "Local baseline matched terminology: " + ", ".join(candidate.matched_terms),
+                    PIPELINE_VERSION,
+                ),
+            )
+            obligations = {
+                "progress_and_preservation": ("progress", "preservation"),
+                "progress": ("progress",),
+                "preservation": ("preservation",),
+                "type_soundness": ("type_soundness",),
+            }[candidate.result_kind]
+            for obligation in obligations:
+                cursor.execute(
+                    """
+                    INSERT INTO proof_obligations (proof_result_id, obligation_kind)
+                    VALUES (%s, %s)
+                    """,
+                    (proof_result_id, obligation),
+                )
+        cursor.execute(
+            "UPDATE pipeline_runs SET finished_at = now() WHERE id = %s",
+            (pipeline_run_id,),
+        )
+        cursor.execute(
             """
             UPDATE jobs SET status = 'succeeded', result = %s,
                 leased_until = NULL, updated_at = now()
             WHERE id = %s
             """,
-            (json.dumps(result), job_id),
+            (json.dumps(processed.result), job_id),
         )
 
 
@@ -113,7 +281,7 @@ def fail_job(connection: psycopg.Connection[Any], job: dict[str, Any], error: Ex
         )
 
 
-def process_job(job: dict[str, Any], data_root: Path) -> dict[str, Any]:
+def process_job(job: dict[str, Any], data_root: Path) -> ProcessedDocument:
     if job["job_type"] != "extract_document":
         raise ValueError(f"unsupported job type: {job['job_type']}")
     payload = job["payload"]
@@ -137,8 +305,9 @@ def run() -> None:
                         time.sleep(poll_seconds)
                         continue
                     try:
-                        result = process_job(job, data_root)
-                        complete_job(connection, job["id"], result)
+                        processed = process_job(job, data_root)
+                        document_id = UUID(str(job["payload"]["document_id"]))
+                        persist_success(connection, job["id"], document_id, processed)
                     except Exception as error:  # job boundary: failure is persisted
                         LOG.exception("job failed", extra={"job_id": str(job["id"])})
                         fail_job(connection, job, error)

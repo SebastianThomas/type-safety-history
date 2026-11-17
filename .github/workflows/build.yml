@@ -30,6 +30,23 @@ jobs:
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
+      - name: Verify migrations and readiness
+        env:
+          DATA_ROOT: /tmp/type-safety-history-ci-data
+          PORT: "8081"
+          CURATOR_TOKEN: ci-only-token
+        run: |
+          cargo run -p type-safety-history-api > /tmp/type-safety-history-api.log 2>&1 &
+          api_pid=$!
+          trap 'kill "$api_pid" || true' EXIT
+          for attempt in $(seq 1 60); do
+            if curl --fail --silent http://localhost:8081/health/ready; then
+              exit 0
+            fi
+            sleep 1
+          done
+          cat /tmp/type-safety-history-api.log
+          exit 1
 
   python:
     runs-on: ubuntu-latest
@@ -48,3 +65,10 @@ jobs:
       - uses: azure/setup-kubectl@v4
       - run: kubectl kustomize db >/dev/null
       - run: kubectl kustomize deploy >/dev/null
+
+  containers:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - run: docker build -f containers/api.Dockerfile -t type-safety-history-api:test .
+      - run: docker build -f containers/ml.Dockerfile -t type-safety-history-ml:test .

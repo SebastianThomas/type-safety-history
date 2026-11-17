@@ -59,6 +59,25 @@ curl -X POST http://localhost:8080/api/v1/imports/crossref \
 
 The initial DOI queue is in [`fixtures/seed-works.json`](fixtures/seed-works.json).
 
+## Local PDF ingestion
+
+PDF acquisition is curator-driven. The upload must include its source URL,
+reliability, rights status, a concrete rights basis, and explicit ML and
+redistribution permissions. Metadata must be the first multipart field so the
+service can reject disallowed content before accepting file bytes.
+
+```bash
+curl -X POST http://localhost:8080/api/v1/documents/upload \
+  -H "Authorization: Bearer $CURATOR_TOKEN" \
+  -F 'metadata={"work_id":"<uuid>","source_url":"https://repository.example/paper","source_kind":"institutional_repository","reliability":"primary","rights_status":"open_redistributable","license_name":"CC BY 4.0","license_url":"https://creativecommons.org/licenses/by/4.0/","rights_basis":"Repository record explicitly identifies CC BY 4.0.","ml_use_permitted":true,"redistribution_permitted":true};type=application/json' \
+  -F 'file=@paper.pdf;type=application/pdf'
+```
+
+The service streams the file, enforces a 50 MiB limit, validates PDF magic,
+computes SHA-256, and atomically stores it under `/data/objects/sha256/`.
+The local Python worker extracts permitted documents and creates page-level
+machine candidates for curator review.
+
 ## Policies
 
 - [`docs/corpus-policy.md`](docs/corpus-policy.md)

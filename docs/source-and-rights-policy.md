@@ -61,3 +61,18 @@ Model weights are acquired in a controlled preparation step and recorded with
 source, version, checksum and licence. Runtime pods do not need outbound network
 access. Documents whose terms do not permit local ML are excluded from jobs.
 
+The initial `local-term-baseline-v1` pipeline is deliberately deterministic and
+conservative. It detects terminology associated with progress, preservation,
+subject reduction and type soundness, records only page/character coordinates
+and a paraphrase in PostgreSQL, and leaves every result in `machine_candidate`.
+It is a discovery aid, not evidence that a theorem actually appears or is valid.
+
+## Curator-supplied documents
+
+A local PDF is accepted only when the curator records a reliable source URL and
+a specific rights basis. `open_redistributable` requires a licence name and URL.
+`internal_research_copy` can never be marked redistributable. Metadata-only,
+link-only, unknown and prohibited sources cannot be uploaded. File bytes are
+not fetched by the service from the recorded URL; acquisition remains a human
+action performed under the source's applicable terms.
+

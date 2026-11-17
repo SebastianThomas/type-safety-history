@@ -35,6 +35,10 @@ async fn main() -> Result<()> {
     let data_root = PathBuf::from(env::var("DATA_ROOT").unwrap_or_else(|_| "/data".into()));
     create_shared_directory(&data_root.join("objects")).await?;
     create_shared_directory(&data_root.join("derived")).await?;
+    create_shared_directory(&data_root.join("tmp")).await?;
+    create_shared_directory(&data_root.join("zarr")).await?;
+    create_shared_directory(&data_root.join("parquet")).await?;
+    create_shared_directory(&data_root.join("models")).await?;
 
     let db = PgPoolOptions::new()
         .max_connections(10)
@@ -69,7 +73,7 @@ async fn main() -> Result<()> {
     };
     let app = Router::new()
         .merge(routes::router())
-        .layer(DefaultBodyLimit::max(2 * 1024 * 1024))
+        .layer(DefaultBodyLimit::max(64 * 1024 * 1024))
         .layer(CatchPanicLayer::new())
         .layer(TraceLayer::new_for_http())
         .with_state(state);
