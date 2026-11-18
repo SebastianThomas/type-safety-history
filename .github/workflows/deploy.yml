@@ -90,10 +90,7 @@ jobs:
             deployment/type-safety-history-worker
           rollout-timeout: 600s
 
-      - name: Seed research queue and verify storage
+      - name: Remove superseded combined Deployment
         run: |
           set -euo pipefail
-          kubectl -n type-safety-history exec deployment/type-safety-history-api -c api -- \
-            api seed /app/fixtures/seed-works.json
-          kubectl -n type-safety-history exec deployment/type-safety-history-api -c api -- \
-            api verify-storage
+          kubectl -n type-safety-history delete deployment type-safety-history --ignore-not-found

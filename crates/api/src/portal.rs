@@ -1,7 +1,7 @@
 use axum::{
     Router,
     http::{HeaderMap, HeaderValue, header},
-    response::{Html, IntoResponse, Response},
+    response::{Html, IntoResponse, Redirect, Response},
     routing::get,
 };
 
@@ -9,9 +9,14 @@ use crate::AppState;
 
 pub(crate) fn router() -> Router<AppState> {
     Router::new()
+        .route("/", get(home))
         .route("/curate", get(curator_portal))
         .route("/docs", get(api_docs))
         .route("/api/openapi.json", get(openapi))
+}
+
+async fn home() -> Redirect {
+    Redirect::temporary("/dashboard")
 }
 
 fn html_response(document: &'static str) -> Response {
@@ -52,6 +57,18 @@ async fn openapi() -> impl IntoResponse {
 
 #[cfg(test)]
 mod tests {
+    use axum::{
+        http::{StatusCode, header},
+        response::IntoResponse,
+    };
+
+    #[tokio::test]
+    async fn root_redirects_to_dashboard() {
+        let response = super::home().await.into_response();
+        assert_eq!(response.status(), StatusCode::TEMPORARY_REDIRECT);
+        assert_eq!(response.headers()[header::LOCATION], "/dashboard");
+    }
+
     #[test]
     fn bundled_openapi_is_valid_json() {
         let document: serde_json::Value =

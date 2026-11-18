@@ -46,6 +46,19 @@ Repository Actions configuration:
 - `CURATOR_TOKEN`: long random bootstrap administrator token.
 - `OPENALEX_API_KEY`: optional; omit or leave empty to disable OpenAlex.
 
+Generate `CURATOR_TOKEN`, store it in the protected `production` GitHub
+environment, and print it once for transfer to a password manager:
+
+```bash
+./scripts/set-curator-token.sh
+```
+
+The script uses 256 bits from OpenSSL and sends the value to `gh secret set`
+over standard input, so it is not exposed as a command-line argument. Override
+the defaults with `GH_REPO=owner/repository` or `GH_ENVIRONMENT=name`. GitHub
+cannot reveal an Actions secret after it is stored; retain the printed value.
+The Kubernetes Secret changes on the next deployment.
+
 `production` environment variable:
 
 - `CROSSREF_MAILTO`: monitored research contact email used for Crossref's
@@ -65,7 +78,10 @@ Apply `db/` first and wait for the CNPG cluster to become ready. Then apply
 `deploy/` after replacing `${API_IMAGE}` and `${ML_IMAGE}` with published image
 references. Both Kustomizations include the same idempotent Namespace definition.
 Both Deployments run the idempotent migrations in an init container. The API
-and worker therefore start independently once the database schema is ready.
+also seeds the research queue and verifies storage before its application
+container starts. The API and worker therefore start independently once the
+database schema is ready, without granting CI permission to execute commands in
+running pods.
 
 The Kubernetes pod and every container use the runtime-default seccomp profile,
 drop Linux capabilities and use immutable root filesystems. A bounded
