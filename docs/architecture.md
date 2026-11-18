@@ -2,10 +2,13 @@
 
 ## Decision summary
 
-The application is one Kubernetes Deployment and one pod. Its Rust API and
-Python worker are separate containers so they retain distinct health,
-resources, users and dependency sets. They share a local volume and PostgreSQL.
-CNPG is an independent data service, not another application deployment.
+The Rust API and Python worker use separate Kubernetes Deployments so a crash,
+restart or rollout of one does not stop the other. They retain distinct health,
+resources, users and dependency sets while sharing a local volume and
+PostgreSQL. Each pod runs the idempotent SQLx migrations before its application
+container starts, so schema availability does not depend on the API server
+becoming healthy. CNPG is an independent data service, not another application
+deployment.
 
 Rust owns canonical writes, validation, provenance and rights enforcement.
 Python claims durable jobs from PostgreSQL and emits derived candidates. It
@@ -70,7 +73,8 @@ and performs only local processing.
 
 ## Scaling boundary
 
-The local-path volume and single pod deliberately trade horizontal scaling for
-simple homelab operation. Moving beyond one pod requires an object-store backend
-and must not be attempted by mounting the node-local volume from another node.
+The local-path volume deliberately trades horizontal scaling for simple homelab
+operation. The API and worker pods must be scheduled on the volume's node;
+moving either workload to another node or adding replicas requires an
+object-store backend.
 

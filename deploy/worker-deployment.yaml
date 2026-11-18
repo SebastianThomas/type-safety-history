@@ -1,0 +1,103 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: type-safety-history-worker
+  labels:
+    app.kubernetes.io/name: type-safety-history
+    app.kubernetes.io/component: worker
+spec:
+  replicas: 1
+  strategy: { type: Recreate }
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: type-safety-history
+      app.kubernetes.io/component: worker
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: type-safety-history
+        app.kubernetes.io/component: worker
+    spec:
+      initContainers:
+        - name: wait-for-db
+          image: busybox:1.38
+          command: [sh, -c, "until nc -z type-safety-history-db-rw 5432; do sleep 2; done"]
+          resources:
+            requests: { cpu: 5m, memory: 8Mi }
+            limits: { memory: 16Mi }
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities: { drop: [ALL] }
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 65534
+        - name: migrate-db
+          image: ${API_IMAGE}
+          args: [migrate]
+          env:
+            - name: DATABASE_URL
+              valueFrom: { secretKeyRef: { name: type-safety-history-db-app, key: uri } }
+          resources:
+            requests: { cpu: 10m, memory: 32Mi }
+            limits: { memory: 128Mi }
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities: { drop: [ALL] }
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 10001
+        - name: prepare-data-volume
+          image: busybox:1.38
+          command:
+            - sh
+            - -c
+            - >-
+              install -d -m 2770
+              /data/objects /data/derived /data/zarr
+              /data/parquet /data/models /data/tmp &&
+              chgrp 10000
+              /data/objects /data/derived /data/zarr
+              /data/parquet /data/models /data/tmp &&
+              chmod 2770
+              /data/objects /data/derived /data/zarr
+              /data/parquet /data/models /data/tmp
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities: { drop: [ALL] }
+            readOnlyRootFilesystem: true
+            runAsGroup: 10000
+            runAsUser: 0
+          volumeMounts:
+            - { name: data, mountPath: /data }
+          resources:
+            requests: { cpu: 5m, memory: 8Mi }
+            limits: { memory: 16Mi }
+      securityContext:
+        fsGroup: 10000
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile: { type: RuntimeDefault }
+      volumes:
+        - name: data
+          persistentVolumeClaim: { claimName: type-safety-history-data }
+        - name: runtime-tmp
+          emptyDir: { sizeLimit: 256Mi }
+      containers:
+        - name: ml-worker
+          image: ${ML_IMAGE}
+          imagePullPolicy: IfNotPresent
+          env:
+            - { name: DATA_ROOT, value: /data }
+            - name: DATABASE_URL
+              valueFrom: { secretKeyRef: { name: type-safety-history-db-app, key: uri } }
+          volumeMounts:
+            - { name: data, mountPath: /data }
+            - { name: runtime-tmp, mountPath: /tmp }
+          resources:
+            requests: { cpu: 50m, memory: 256Mi }
+            limits: { memory: 1024Mi }
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities: { drop: [ALL] }
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 10002

@@ -21,6 +21,17 @@ services:
       timeout: 3s
       retries: 20
 
+  migrate:
+    build:
+      context: .
+      dockerfile: containers/api.Dockerfile
+    command: [migrate]
+    environment:
+      DATABASE_URL: postgresql://type_safety_history:type_safety_history@postgres:5432/type_safety_history
+    depends_on:
+      postgres:
+        condition: service_healthy
+
   api:
     build:
       context: .
@@ -39,6 +50,8 @@ services:
     group_add: ["10000"]
     depends_on:
       data-init:
+        condition: service_completed_successfully
+      migrate:
         condition: service_completed_successfully
       postgres:
         condition: service_healthy
@@ -59,7 +72,11 @@ services:
       - app-data:/data
     group_add: ["10000"]
     depends_on:
-      api:
+      data-init:
+        condition: service_completed_successfully
+      migrate:
+        condition: service_completed_successfully
+      postgres:
         condition: service_healthy
 
 volumes:

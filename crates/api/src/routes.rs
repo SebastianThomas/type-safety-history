@@ -1021,7 +1021,7 @@ async fn upload_document(
                 }
                 uploaded = Some(UploadedFile {
                     temporary_path,
-                    sha256: format!("{:x}", hasher.finalize()),
+                    sha256: hex::encode(hasher.finalize()),
                     byte_size,
                 });
             }
@@ -1911,7 +1911,7 @@ async fn sha256_file(path: &Path) -> Result<String, ApiError> {
         }
         hasher.update(&buffer[..count]);
     }
-    Ok(format!("{:x}", hasher.finalize()))
+    Ok(hex::encode(hasher.finalize()))
 }
 
 fn validate_object_key(key: &str) -> Result<(), ApiError> {

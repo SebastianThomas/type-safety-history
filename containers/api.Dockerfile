@@ -1,4 +1,4 @@
-FROM rust:1.90-slim-bookworm AS build
+FROM rust:1.100-slim-bookworm AS build
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates

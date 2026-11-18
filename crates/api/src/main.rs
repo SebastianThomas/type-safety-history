@@ -55,6 +55,11 @@ async fn main() -> Result<()> {
             anyhow::ensure!(arguments.next().is_none(), "usage: api verify-storage");
             return integrity::run().await;
         }
+        Some("migrate") => {
+            init_tracing();
+            anyhow::ensure!(arguments.next().is_none(), "usage: api migrate");
+            return migrate().await;
+        }
         Some(command) => anyhow::bail!("unknown command: {command}"),
         None => {}
     }
@@ -134,12 +139,33 @@ async fn main() -> Result<()> {
 }
 
 async fn create_shared_directory(path: &Path) -> Result<()> {
-    tokio::fs::create_dir_all(path).await?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(0o2770)).await?;
+    match tokio::fs::metadata(path).await {
+        Ok(metadata) => anyhow::ensure!(metadata.is_dir(), "{} is not a directory", path.display()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            tokio::fs::create_dir_all(path).await?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(0o2770)).await?;
+            }
+        }
+        Err(error) => return Err(error.into()),
     }
+    Ok(())
+}
+
+async fn migrate() -> Result<()> {
+    let database_url = env::var("DATABASE_URL").context("DATABASE_URL must be set")?;
+    let db = PgPoolOptions::new()
+        .max_connections(2)
+        .acquire_timeout(Duration::from_secs(10))
+        .connect(&database_url)
+        .await
+        .context("connect to PostgreSQL")?;
+    sqlx::migrate!("../../migrations")
+        .run(&db)
+        .await
+        .context("run database migrations")?;
     Ok(())
 }
 

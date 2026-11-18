@@ -5,6 +5,7 @@ resources:
   - namespace.yaml
   - pvc.yaml
   - deployment.yaml
+  - worker-deployment.yaml
   - service.yaml
   - httproute.yaml
 

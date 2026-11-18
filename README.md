@@ -59,8 +59,9 @@ uv run --project ml pytest
 
 ## Deployment
 
-Kubernetes uses one application `Deployment` with two containers (Rust API and
-Python worker) sharing one local-path PVC. CNPG is reconciled independently:
+Kubernetes uses separate API and worker `Deployment` resources. They share one
+local-path PVC and PostgreSQL, while retaining independent pod lifecycles. CNPG
+is reconciled independently:
 
 ```bash
 kubectl apply -k db

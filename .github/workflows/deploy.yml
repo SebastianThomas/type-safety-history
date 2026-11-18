@@ -85,13 +85,15 @@ jobs:
           images: |
             API_IMAGE=${{ vars.DOCKERHUB_REPOSITORY }}:${{ inputs.tag }}-api
             ML_IMAGE=${{ vars.DOCKERHUB_REPOSITORY }}:${{ inputs.tag }}-ml
-          rollouts: deployment/type-safety-history
+          rollouts: |
+            deployment/type-safety-history-api
+            deployment/type-safety-history-worker
           rollout-timeout: 600s
 
       - name: Seed research queue and verify storage
         run: |
           set -euo pipefail
-          kubectl -n type-safety-history exec deployment/type-safety-history -c api -- \
+          kubectl -n type-safety-history exec deployment/type-safety-history-api -c api -- \
             api seed /app/fixtures/seed-works.json
-          kubectl -n type-safety-history exec deployment/type-safety-history -c api -- \
+          kubectl -n type-safety-history exec deployment/type-safety-history-api -c api -- \
             api verify-storage

@@ -4,7 +4,6 @@ use axum::{
     http::{HeaderMap, StatusCode},
     routing::{get, post},
 };
-use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -89,7 +88,7 @@ async fn authenticate(state: &AppState, headers: &HeaderMap) -> Result<Principal
             bootstrap: true,
         });
     }
-    let digest = format!("{:x}", Sha256::digest(supplied.as_bytes()));
+    let digest = hex::encode(Sha256::digest(supplied.as_bytes()));
     let principal = sqlx::query_as::<_, Principal>(
         "SELECT u.id AS user_id, u.username, u.display_name, u.role::text AS role, \
          false AS bootstrap FROM curator_api_tokens token \
@@ -245,7 +244,7 @@ async fn create_token(
         return Err(ApiError::BadRequest("label is required".into()));
     }
     let mut random = [0_u8; 32];
-    rand::rng().fill_bytes(&mut random);
+    rand::fill(&mut random);
     let secret = format!(
         "tsh_{}",
         random
@@ -253,7 +252,7 @@ async fn create_token(
             .map(|byte| format!("{byte:02x}"))
             .collect::<String>()
     );
-    let digest = format!("{:x}", Sha256::digest(secret.as_bytes()));
+    let digest = hex::encode(Sha256::digest(secret.as_bytes()));
     let prefix = secret.chars().take(12).collect::<String>();
     let mut tx = state.db.begin().await?;
     let token_id: Uuid = sqlx::query_scalar(

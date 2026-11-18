@@ -64,8 +64,8 @@ Secret before starting the Deployment:
 Apply `db/` first and wait for the CNPG cluster to become ready. Then apply
 `deploy/` after replacing `${API_IMAGE}` and `${ML_IMAGE}` with published image
 references. Both Kustomizations include the same idempotent Namespace definition.
-The API runs migrations before it becomes ready; the worker waits for
-the schema and claims work afterward.
+Both Deployments run the idempotent migrations in an init container. The API
+and worker therefore start independently once the database schema is ready.
 
 The Kubernetes pod and every container use the runtime-default seccomp profile,
 drop Linux capabilities and use immutable root filesystems. A bounded
@@ -86,7 +86,7 @@ admin tokens only for account operations. Review account and token activity via
 Load the curated starting queue after migrations:
 
 ```bash
-kubectl -n type-safety-history exec deploy/type-safety-history -c api -- \
+kubectl -n type-safety-history exec deploy/type-safety-history-api -c api -- \
   api seed /app/fixtures/seed-works.json
 ```
 
@@ -105,7 +105,7 @@ consolidation, takedown and the statistics interface.
 After restoring PostgreSQL and the application volume, run:
 
 ```bash
-kubectl -n type-safety-history exec deploy/type-safety-history -c api -- \
+kubectl -n type-safety-history exec deploy/type-safety-history-api -c api -- \
   api verify-storage
 ```
 
