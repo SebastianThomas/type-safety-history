@@ -19,18 +19,6 @@ spec:
         app.kubernetes.io/component: api
     spec:
       initContainers:
-        - name: wait-for-db
-          image: busybox:1.38
-          command: [sh, -c, "until nc -z type-safety-history-db-rw 5432; do sleep 2; done"]
-          resources:
-            requests: { cpu: 5m, memory: 8Mi }
-            limits: { memory: 16Mi }
-          securityContext:
-            allowPrivilegeEscalation: false
-            capabilities: { drop: [ALL] }
-            readOnlyRootFilesystem: true
-            runAsNonRoot: true
-            runAsUser: 65534
         - name: migrate-db
           image: ${API_IMAGE}
           args: [migrate]
@@ -72,39 +60,6 @@ spec:
           resources:
             requests: { cpu: 5m, memory: 8Mi }
             limits: { memory: 16Mi }
-        - name: seed-research-queue
-          image: ${API_IMAGE}
-          args: [seed, /app/fixtures/seed-works.json]
-          env:
-            - name: DATABASE_URL
-              valueFrom: { secretKeyRef: { name: type-safety-history-db-app, key: uri } }
-          resources:
-            requests: { cpu: 10m, memory: 32Mi }
-            limits: { memory: 128Mi }
-          securityContext:
-            allowPrivilegeEscalation: false
-            capabilities: { drop: [ALL] }
-            readOnlyRootFilesystem: true
-            runAsNonRoot: true
-            runAsUser: 10001
-        - name: verify-storage
-          image: ${API_IMAGE}
-          args: [verify-storage]
-          env:
-            - { name: DATA_ROOT, value: /data }
-            - name: DATABASE_URL
-              valueFrom: { secretKeyRef: { name: type-safety-history-db-app, key: uri } }
-          volumeMounts:
-            - { name: data, mountPath: /data }
-          resources:
-            requests: { cpu: 10m, memory: 32Mi }
-            limits: { memory: 128Mi }
-          securityContext:
-            allowPrivilegeEscalation: false
-            capabilities: { drop: [ALL] }
-            readOnlyRootFilesystem: true
-            runAsNonRoot: true
-            runAsUser: 10001
       securityContext:
         fsGroup: 10000
         fsGroupChangePolicy: OnRootMismatch

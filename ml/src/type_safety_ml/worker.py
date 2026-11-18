@@ -808,7 +808,8 @@ def run() -> None:
     data_root = Path(os.getenv("DATA_ROOT", "/data"))
     worker_id = os.getenv("WORKER_ID", f"{socket.gethostname()}-{os.getpid()}")
     poll_seconds = float(os.getenv("WORKER_POLL_SECONDS", "2"))
-    LOG.info("worker started", extra={"worker_id": worker_id})
+    LOG.info("worker started: worker_id=%s poll_seconds=%s", worker_id, poll_seconds)
+    last_idle_log = 0.0
 
     while True:
         try:
@@ -816,9 +817,19 @@ def run() -> None:
                 while True:
                     job = claim_job(connection, worker_id)
                     if job is None:
+                        now = time.monotonic()
+                        if now - last_idle_log >= 60:
+                            LOG.info("worker idle: no queued jobs")
+                            last_idle_log = now
                         time.sleep(poll_seconds)
                         continue
                     try:
+                        LOG.info(
+                            "job started: id=%s type=%s attempt=%s",
+                            job["id"],
+                            job["job_type"],
+                            job["attempts"],
+                        )
                         if job["job_type"] == "extract_document":
                             processed = process_job(job, data_root)
                             document_id = UUID(str(job["payload"]["document_id"]))
@@ -850,6 +861,7 @@ def run() -> None:
                             )
                         else:
                             raise ValueError(f"unsupported job type: {job['job_type']}")
+                        LOG.info("job succeeded: id=%s type=%s", job["id"], job["job_type"])
                     except Exception as error:  # job boundary: failure is persisted
                         LOG.exception("job failed", extra={"job_id": str(job["id"])})
                         fail_job(connection, job, error)

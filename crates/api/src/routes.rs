@@ -282,9 +282,9 @@ fn validate_discovery_request(input: &CrossrefDiscoveryRequest) -> Result<(), Ap
             "year range must be valid and at most 100 years".into(),
         ));
     }
-    if !(1..=100).contains(&input.rows) {
+    if !(1..=1000).contains(&input.rows) {
         return Err(ApiError::BadRequest(
-            "rows must be between 1 and 100".into(),
+            "rows must be between 1 and 1000".into(),
         ));
     }
     Ok(())
@@ -673,8 +673,10 @@ fn schedule_request(schedule: &DiscoverySchedule) -> CrossrefDiscoveryRequest {
 
 pub(crate) async fn run_discovery_scheduler(state: AppState) {
     if state.crossref.is_none() {
+        tracing::warn!("Crossref discovery scheduler disabled: CROSSREF_MAILTO is not configured");
         return;
     }
+    tracing::info!("Crossref discovery scheduler started");
     let mut ticker = tokio::time::interval(Duration::from_secs(60));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
@@ -684,10 +686,11 @@ pub(crate) async fn run_discovery_scheduler(state: AppState) {
                 "WITH due AS ( \
                    SELECT id FROM discovery_schedules \
                    WHERE enabled AND next_run_at <= now() \
+                     AND (lease_until IS NULL OR lease_until < now()) \
                    ORDER BY next_run_at FOR UPDATE SKIP LOCKED LIMIT 1 \
                  ) \
-                 UPDATE discovery_schedules schedule SET last_run_at = now(), \
-                   next_run_at = now() + make_interval(mins => schedule.cadence_minutes), \
+                 UPDATE discovery_schedules schedule SET \
+                   lease_until = now() + interval '5 minutes', \
                    updated_at = now() FROM due WHERE schedule.id = due.id \
                  RETURNING schedule.id, schedule.provider, schedule.query_text, \
                    schedule.from_year, schedule.until_year, schedule.requested_rows, \
@@ -707,7 +710,13 @@ pub(crate) async fn run_discovery_scheduler(state: AppState) {
                 }
             };
             let actor = format!("schedule:{}", schedule.created_by);
-            if let Err(error) = run_crossref_discovery(
+            tracing::info!(
+                schedule_id = %schedule.id,
+                query = %schedule.query_text,
+                rows = schedule.requested_rows,
+                "running scheduled Crossref discovery"
+            );
+            match run_crossref_discovery(
                 &state,
                 &schedule_request(&schedule),
                 &actor,
@@ -715,18 +724,49 @@ pub(crate) async fn run_discovery_scheduler(state: AppState) {
             )
             .await
             {
-                tracing::warn!(schedule_id = %schedule.id, %error, "scheduled discovery failed");
-                let _ = sqlx::query(
-                    "INSERT INTO audit_log \
-                     (actor, action, entity_type, entity_id, after_value, reason) \
-                     VALUES ($1, 'scheduled_discovery_failed', 'discovery_schedule', $2, $3, $4)",
-                )
-                .bind(&actor)
-                .bind(schedule.id)
-                .bind(json!({"error": error.to_string()}))
-                .bind("Scheduled Crossref search failed; the next cadence remains scheduled")
-                .execute(&state.db)
-                .await;
+                Ok(result) => {
+                    let result_count = result["result_count"].as_u64().unwrap_or_default();
+                    if let Err(error) = sqlx::query(
+                        "UPDATE discovery_schedules SET last_run_at = now(), \
+                         next_run_at = now() + make_interval(mins => cadence_minutes), \
+                         lease_until = NULL, last_error = NULL, updated_at = now() \
+                         WHERE id = $1",
+                    )
+                    .bind(schedule.id)
+                    .execute(&state.db)
+                    .await
+                    {
+                        tracing::error!(schedule_id = %schedule.id, %error, "failed to complete discovery schedule lease");
+                    } else {
+                        tracing::info!(
+                            schedule_id = %schedule.id,
+                            result_count,
+                            "scheduled Crossref discovery completed"
+                        );
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(schedule_id = %schedule.id, %error, "scheduled discovery failed");
+                    let _ = sqlx::query(
+                        "UPDATE discovery_schedules SET next_run_at = now() + interval '15 minutes', \
+                         lease_until = NULL, last_error = $2, updated_at = now() WHERE id = $1",
+                    )
+                    .bind(schedule.id)
+                    .bind(error.to_string())
+                    .execute(&state.db)
+                    .await;
+                    let _ = sqlx::query(
+                        "INSERT INTO audit_log \
+                         (actor, action, entity_type, entity_id, after_value, reason) \
+                         VALUES ($1, 'scheduled_discovery_failed', 'discovery_schedule', $2, $3, $4)",
+                    )
+                    .bind(&actor)
+                    .bind(schedule.id)
+                    .bind(json!({"error": error.to_string()}))
+                    .bind("Scheduled Crossref search failed; the next cadence remains scheduled")
+                    .execute(&state.db)
+                    .await;
+                }
             }
         }
     }
@@ -2020,6 +2060,24 @@ mod tests {
     fn doi_is_normalized() {
         assert_eq!(normalize_doi(" HTTPS://doi.org/10.1/ABC "), "10.1/abc");
         assert_eq!(normalize_doi("https://doi.org/10.1/ABC"), "10.1/abc");
+    }
+
+    #[test]
+    fn discovery_accepts_crossref_page_limit() {
+        let request = CrossrefDiscoveryRequest {
+            query: "type soundness".into(),
+            from_year: 1950,
+            until_year: 2026,
+            rows: 1000,
+        };
+        assert!(validate_discovery_request(&request).is_ok());
+        assert!(
+            validate_discovery_request(&CrossrefDiscoveryRequest {
+                rows: 1001,
+                ..request
+            })
+            .is_err()
+        );
     }
 
     #[test]

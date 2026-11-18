@@ -77,11 +77,18 @@ Secret before starting the Deployment:
 Apply `db/` first and wait for the CNPG cluster to become ready. Then apply
 `deploy/` after replacing `${API_IMAGE}` and `${ML_IMAGE}` with published image
 references. Both Kustomizations include the same idempotent Namespace definition.
-Both Deployments run the idempotent migrations in an init container. The API
-also seeds the research queue and verifies storage before its application
-container starts. The API and worker therefore start independently once the
-database schema is ready, without granting CI permission to execute commands in
-running pods.
+Both Deployments have two init containers: one runs idempotent migrations and
+one prepares the shared local volume permissions. A failed migration is retried
+by Kubernetes, so a separate database-wait container is unnecessary. The
+migrations install the curated anchors and default discovery schedules. Storage
+verification remains an explicit restoration/integrity operation instead of
+blocking every application restart.
+
+Application Deployments use `Recreate` and retain all durable state in CNPG and
+the local PVC. Discovery schedules and worker jobs use expiring database leases;
+an API or worker process killed after claiming work can therefore be retried by
+its replacement. File-producing worker operations write temporary paths and
+rename them into place before committing their database result.
 
 The Kubernetes pod and every container use the runtime-default seccomp profile,
 drop Linux capabilities and use immutable root filesystems. A bounded
@@ -99,14 +106,15 @@ Use viewer tokens for read-only research access, curator tokens for review, and
 admin tokens only for account operations. Review account and token activity via
 `/api/v1/audit` and `/api/v1/admin/users/{id}/tokens`.
 
-Load the curated starting queue after migrations:
+To refresh the curated anchors manually:
 
 ```bash
 kubectl -n type-safety-history exec deploy/type-safety-history-api -c api -- \
   api seed /app/fixtures/seed-works.json
 ```
 
-The command is idempotent and does not require outbound network access.
+The command is idempotent and does not require outbound network access. It is
+not required during normal deployment.
 
 ## Backups
 

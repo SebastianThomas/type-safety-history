@@ -89,8 +89,12 @@ curl -X POST http://localhost:8080/api/v1/imports/crossref \
   --data '{"doi":"10.1006/inco.1994.1093"}'
 ```
 
-The initial DOI queue is in [`fixtures/seed-works.json`](fixtures/seed-works.json).
-Load or refresh it without network access after the database is available:
+Database migrations install the two curated anchors and five enabled Crossref
+discovery schedules. On first startup the schedules request up to 1,000 metadata
+records each; subsequent runs are weekly and remain deduplicated in PostgreSQL.
+The equivalent DOI fixture is retained in
+[`fixtures/seed-works.json`](fixtures/seed-works.json) and can be refreshed
+without network access:
 
 ```bash
 docker compose run --rm api seed /app/fixtures/seed-works.json

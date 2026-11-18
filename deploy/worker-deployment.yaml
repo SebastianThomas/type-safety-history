@@ -19,18 +19,6 @@ spec:
         app.kubernetes.io/component: worker
     spec:
       initContainers:
-        - name: wait-for-db
-          image: busybox:1.38
-          command: [sh, -c, "until nc -z type-safety-history-db-rw 5432; do sleep 2; done"]
-          resources:
-            requests: { cpu: 5m, memory: 8Mi }
-            limits: { memory: 16Mi }
-          securityContext:
-            allowPrivilegeEscalation: false
-            capabilities: { drop: [ALL] }
-            readOnlyRootFilesystem: true
-            runAsNonRoot: true
-            runAsUser: 65534
         - name: migrate-db
           image: ${API_IMAGE}
           args: [migrate]

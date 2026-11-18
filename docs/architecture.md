@@ -66,10 +66,20 @@ no source text, labels or high-cardinality work identifiers are emitted.
 
 Saved Crossref searches live in PostgreSQL with bounded result counts and a
 minimum hourly cadence. The Rust process atomically claims due schedules with
-row locking, advances their next-run timestamp before the network request and
-records both successful coverage and failures in the audit trail. Only selected
-bibliographic fields are retained. The Python worker remains network-agnostic
-and performs only local processing.
+row locking and a five-minute lease. It advances the regular cadence only after
+the metadata transaction succeeds; a failed request retries after 15 minutes,
+and a process killed mid-request is reclaimed when its lease expires. Coverage
+and failures remain in the audit trail. Only selected bibliographic fields are
+retained. The Python worker remains network-agnostic and performs only local
+processing.
+
+The bootstrap migration enables five complementary type-safety searches from
+1950 through the current year. Each requests at most 1,000 records on its first
+run and then refreshes weekly. Crossref requests are serialized, identified with
+the configured research contact, cached through database upserts and exclude
+abstracts and full text. This gives the initial deployment metadata throughput
+without treating a discovery hit as a verified work or bypassing document
+licensing review.
 
 ## Scaling boundary
 
