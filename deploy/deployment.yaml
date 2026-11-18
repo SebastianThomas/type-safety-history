@@ -30,11 +30,21 @@ spec:
           command:
             - sh
             - -c
-            - install -d -m 2770 -o 10001 -g 10000 /data/objects /data/derived /data/zarr /data/parquet /data/models /data/tmp
+            - >-
+              install -d -m 2770
+              /data/objects /data/derived /data/zarr
+              /data/parquet /data/models /data/tmp &&
+              chgrp 10000
+              /data/objects /data/derived /data/zarr
+              /data/parquet /data/models /data/tmp &&
+              chmod 2770
+              /data/objects /data/derived /data/zarr
+              /data/parquet /data/models /data/tmp
           securityContext:
             allowPrivilegeEscalation: false
             capabilities: { drop: [ALL] }
             readOnlyRootFilesystem: true
+            runAsGroup: 10000
             runAsUser: 0
           volumeMounts:
             - { name: data, mountPath: /data }
