@@ -58,7 +58,7 @@ jobs:
       name: production
       url: https://type-safety-history.sthomas.ch
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           ref: ${{ needs.gate.outputs.tag }}
 
