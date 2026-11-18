@@ -23,7 +23,7 @@ jobs:
     env:
       DATABASE_URL: postgresql://type_safety_history:type_safety_history@localhost:5432/type_safety_history
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt,clippy
@@ -52,7 +52,7 @@ jobs:
   python:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: astral-sh/setup-uv@v7
         with: { enable-cache: true }
       - run: uv sync --project ml --all-groups
@@ -80,7 +80,7 @@ jobs:
       CURATOR_TOKEN: ci-only-token
       PORT: "8081"
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: astral-sh/setup-uv@v7
         with: { enable-cache: true }
@@ -113,7 +113,7 @@ jobs:
   manifests:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: azure/setup-kubectl@v4
       - run: kubectl kustomize db >/dev/null
       - run: kubectl kustomize deploy >/dev/null
@@ -121,7 +121,7 @@ jobs:
   containers:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - run: docker build -f containers/api.Dockerfile -t type-safety-history-api:test .
       - run: docker build -f containers/ml.Dockerfile -t type-safety-history-ml:test .
 
@@ -130,7 +130,7 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - name: Vulnerability, secret, licence, and configuration scan
         uses: aquasecurity/trivy-action@v0.36.0
         with:
@@ -191,7 +191,7 @@ jobs:
           - component: ml
             dockerfile: containers/ml.Dockerfile
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - name: Sign in to Docker Hub
         uses: docker/login-action@v4
         with:
@@ -224,7 +224,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - name: Create GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
