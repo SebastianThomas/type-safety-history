@@ -78,6 +78,18 @@ computes SHA-256, and atomically stores it under `/data/objects/sha256/`.
 The local Python worker extracts permitted documents and creates page-level
 machine candidates for curator review.
 
+## Timeline and exports
+
+`GET /api/v1/timeline` returns only curator-approved proof records. Curators can
+create an approved record from a primary-source document using
+`POST /api/v1/proof-results/curated`; exact page evidence, a paraphrase, actor,
+and review reason are mandatory.
+
+`POST /api/v1/exports` queues a local Parquet export. The sidecar writes a
+checksummed Zstandard-compressed file under `/data/parquet/approved-proofs/`.
+Exports contain bibliographic metadata, proof classifications, paraphrases and
+evidence coordinates, but no extracted PDF text.
+
 ## Policies
 
 - [`docs/corpus-policy.md`](docs/corpus-policy.md)

@@ -16,8 +16,12 @@ a canonical scholarly assertion.
 
 PostgreSQL is canonical for metadata and curation. `/data/objects` is intended
 for content-addressed acquired objects. `/data/derived` contains reproducible
-extraction and ML outputs. Future Zarr and Parquet datasets belong under
-`/data/zarr` and `/data/parquet`; neither is canonical.
+extraction and ML outputs. Parquet exports live under `/data/parquet`; future
+embedding arrays belong under `/data/zarr`. Neither is canonical.
+
+Approved-proof Parquet exports are reproducible projections of PostgreSQL. Each
+export is tracked with its object key, SHA-256 digest, row count, requester and
+completion time. Restricted source text is never included in this projection.
 
 The blob boundary is represented by relative object keys. Absolute paths and
 parent traversal are rejected in both services.

@@ -12,6 +12,8 @@ from typing import Any
 from uuid import UUID
 
 import psycopg
+import pyarrow as pa
+import pyarrow.parquet as pq
 import pymupdf
 from psycopg.rows import dict_row
 
@@ -153,6 +155,11 @@ def claim_job(connection: psycopg.Connection[Any], worker_id: str) -> dict[str, 
             """,
             (worker_id, LEASE_SECONDS, job["id"]),
         )
+        if job["job_type"] == "export_approved_proofs_parquet":
+            cursor.execute(
+                "UPDATE exports SET status = 'running', error = NULL WHERE id = %s",
+                (job["payload"]["export_id"],),
+            )
         return job
 
 
@@ -279,6 +286,11 @@ def fail_job(connection: psycopg.Connection[Any], job: dict[str, Any], error: Ex
             """,
             ("dead_letter" if terminal else "failed", str(error)[:2000], job["id"]),
         )
+        if job["job_type"] == "export_approved_proofs_parquet":
+            connection.execute(
+                "UPDATE exports SET status = 'failed', error = %s WHERE id = %s",
+                (str(error)[:2000], job["payload"]["export_id"]),
+            )
 
 
 def process_job(job: dict[str, Any], data_root: Path) -> ProcessedDocument:
@@ -287,6 +299,116 @@ def process_job(job: dict[str, Any], data_root: Path) -> ProcessedDocument:
     payload = job["payload"]
     path = safe_object_path(data_root, payload["object_key"])
     return extract_pdf(path, data_root / "derived", UUID(str(payload["document_id"])))
+
+
+def export_approved_proofs(
+    connection: psycopg.Connection[Any], data_root: Path, export_id: UUID
+) -> tuple[str, str, int]:
+    with connection.transaction(), connection.cursor(row_factory=dict_row) as cursor:
+        cursor.execute(
+            """
+            SELECT
+                w.id::text AS work_id,
+                w.title,
+                w.publication_year,
+                w.doi,
+                pr.id::text AS proof_result_id,
+                pr.theorem_name,
+                pr.result_kind,
+                pr.proof_method,
+                pr.statement_summary,
+                l.name AS language,
+                ds.page_start,
+                ds.page_end,
+                ds.char_start,
+                ds.char_end,
+                e.paraphrase AS evidence_paraphrase,
+                s.url AS source_url,
+                s.reliability::text AS source_reliability,
+                s.rights_status::text AS source_rights_status
+            FROM proof_results pr
+            JOIN works w ON w.id = pr.work_id
+            LEFT JOIN languages l ON l.id = pr.language_id
+            LEFT JOIN evidence e ON e.proof_result_id = pr.id
+            LEFT JOIN document_spans ds ON ds.id = e.document_span_id
+            LEFT JOIN documents d ON d.id = ds.document_id
+            LEFT JOIN sources s ON s.id = d.source_id
+            WHERE pr.status = 'curator_approved'
+            ORDER BY w.publication_year NULLS LAST, w.title, pr.id, ds.page_start
+            """
+        )
+        rows = [dict(row) for row in cursor.fetchall()]
+
+    output_dir = data_root / "parquet" / "approved-proofs"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    destination = output_dir / f"{export_id}.parquet"
+    temporary = output_dir / f"{export_id}.parquet.tmp"
+    schema = pa.schema(
+        [
+            ("work_id", pa.string()),
+            ("title", pa.string()),
+            ("publication_year", pa.int32()),
+            ("doi", pa.string()),
+            ("proof_result_id", pa.string()),
+            ("theorem_name", pa.string()),
+            ("result_kind", pa.string()),
+            ("proof_method", pa.string()),
+            ("statement_summary", pa.string()),
+            ("language", pa.string()),
+            ("page_start", pa.int32()),
+            ("page_end", pa.int32()),
+            ("char_start", pa.int32()),
+            ("char_end", pa.int32()),
+            ("evidence_paraphrase", pa.string()),
+            ("source_url", pa.string()),
+            ("source_reliability", pa.string()),
+            ("source_rights_status", pa.string()),
+        ]
+    )
+    table = pa.Table.from_pylist(rows, schema=schema)
+    pq.write_table(table, temporary, compression="zstd")
+    temporary.replace(destination)
+    digest = hashlib.sha256()
+    with destination.open("rb") as exported:
+        for chunk in iter(lambda: exported.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return (
+        str(destination.relative_to(data_root)),
+        digest.hexdigest(),
+        table.num_rows,
+    )
+
+
+def persist_export_success(
+    connection: psycopg.Connection[Any],
+    job_id: UUID,
+    export_id: UUID,
+    object_key: str,
+    sha256: str,
+    row_count: int,
+) -> None:
+    with connection.transaction():
+        connection.execute(
+            """
+            UPDATE exports SET status = 'succeeded', object_key = %s, sha256 = %s,
+                row_count = %s, finished_at = now(), error = NULL
+            WHERE id = %s
+            """,
+            (object_key, sha256, row_count, export_id),
+        )
+        connection.execute(
+            """
+            UPDATE jobs SET status = 'succeeded', result = %s,
+                leased_until = NULL, updated_at = now()
+            WHERE id = %s
+            """,
+            (
+                json.dumps(
+                    {"object_key": object_key, "sha256": sha256, "row_count": row_count}
+                ),
+                job_id,
+            ),
+        )
 
 
 def run() -> None:
@@ -305,9 +427,25 @@ def run() -> None:
                         time.sleep(poll_seconds)
                         continue
                     try:
-                        processed = process_job(job, data_root)
-                        document_id = UUID(str(job["payload"]["document_id"]))
-                        persist_success(connection, job["id"], document_id, processed)
+                        if job["job_type"] == "extract_document":
+                            processed = process_job(job, data_root)
+                            document_id = UUID(str(job["payload"]["document_id"]))
+                            persist_success(connection, job["id"], document_id, processed)
+                        elif job["job_type"] == "export_approved_proofs_parquet":
+                            export_id = UUID(str(job["payload"]["export_id"]))
+                            object_key, sha256, row_count = export_approved_proofs(
+                                connection, data_root, export_id
+                            )
+                            persist_export_success(
+                                connection,
+                                job["id"],
+                                export_id,
+                                object_key,
+                                sha256,
+                                row_count,
+                            )
+                        else:
+                            raise ValueError(f"unsupported job type: {job['job_type']}")
                     except Exception as error:  # job boundary: failure is persisted
                         LOG.exception("job failed", extra={"job_id": str(job["id"])})
                         fail_job(connection, job, error)

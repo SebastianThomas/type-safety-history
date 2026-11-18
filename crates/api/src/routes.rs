@@ -28,8 +28,12 @@ pub(crate) fn router() -> Router<AppState> {
         .route("/api/v1/documents/upload", post(upload_document))
         .route("/api/v1/imports/crossref", post(import_crossref))
         .route("/api/v1/proof-results/candidates", get(list_candidates))
+        .route("/api/v1/proof-results/curated", post(create_curated_proof))
         .route("/api/v1/proof-results/{id}", get(get_proof_result))
         .route("/api/v1/proof-results/{id}/review", post(review_candidate))
+        .route("/api/v1/timeline", get(timeline))
+        .route("/api/v1/exports", post(create_export))
+        .route("/api/v1/exports/{id}", get(get_export))
 }
 
 async fn live() -> Json<Value> {
@@ -844,6 +848,293 @@ async fn get_proof_result(
     .fetch_all(&state.db)
     .await?;
     Ok(Json(json!({"proof_result": result, "evidence": evidence})))
+}
+
+#[derive(Deserialize)]
+struct CreateCuratedProof {
+    work_id: Uuid,
+    document_id: Uuid,
+    theorem_name: Option<String>,
+    result_kind: String,
+    proof_method: Option<String>,
+    statement_summary: String,
+    obligations: Vec<String>,
+    page_start: i32,
+    page_end: Option<i32>,
+    char_start: Option<i32>,
+    char_end: Option<i32>,
+    content_sha256: Option<String>,
+    evidence_paraphrase: String,
+    actor: String,
+    reason: String,
+}
+
+async fn create_curated_proof(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(input): Json<CreateCuratedProof>,
+) -> Result<(StatusCode, Json<Value>), ApiError> {
+    require_curator(&state, &headers)?;
+    validate_curated_proof(&input)?;
+    let mut tx = state.db.begin().await?;
+    let reliable_document_exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM documents d JOIN sources s ON s.id = d.source_id \
+         WHERE d.id = $1 AND d.work_id = $2 AND s.reliability = 'primary')",
+    )
+    .bind(input.document_id)
+    .bind(input.work_id)
+    .fetch_one(&mut *tx)
+    .await?;
+    if !reliable_document_exists {
+        return Err(ApiError::BadRequest(
+            "curated proof evidence must use a primary source document for this work".into(),
+        ));
+    }
+    let proof_result_id = Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO proof_results \
+         (id, work_id, theorem_name, result_kind, proof_method, statement_summary, status, \
+          source_document_id) \
+         VALUES ($1, $2, $3, $4, $5, $6, 'curator_approved', $7)",
+    )
+    .bind(proof_result_id)
+    .bind(input.work_id)
+    .bind(input.theorem_name.as_deref().map(str::trim))
+    .bind(&input.result_kind)
+    .bind(input.proof_method.as_deref().map(str::trim))
+    .bind(input.statement_summary.trim())
+    .bind(input.document_id)
+    .execute(&mut *tx)
+    .await?;
+    for obligation in &input.obligations {
+        sqlx::query(
+            "INSERT INTO proof_obligations (proof_result_id, obligation_kind) VALUES ($1, $2)",
+        )
+        .bind(proof_result_id)
+        .bind(obligation)
+        .execute(&mut *tx)
+        .await?;
+    }
+    let span_id: Uuid = sqlx::query_scalar(
+        "INSERT INTO document_spans \
+         (document_id, page_start, page_end, char_start, char_end, content_sha256) \
+         VALUES ($1, $2, $3, $4, $5, $6) RETURNING id",
+    )
+    .bind(input.document_id)
+    .bind(input.page_start)
+    .bind(input.page_end.unwrap_or(input.page_start))
+    .bind(input.char_start)
+    .bind(input.char_end)
+    .bind(input.content_sha256.as_deref().map(str::to_ascii_lowercase))
+    .fetch_one(&mut *tx)
+    .await?;
+    sqlx::query(
+        "INSERT INTO evidence \
+         (proof_result_id, document_span_id, paraphrase, created_by) \
+         VALUES ($1, $2, $3, $4)",
+    )
+    .bind(proof_result_id)
+    .bind(span_id)
+    .bind(input.evidence_paraphrase.trim())
+    .bind(input.actor.trim())
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query(
+        "INSERT INTO audit_log \
+         (actor, action, entity_type, entity_id, after_value, reason) \
+         VALUES ($1, 'create_curated_proof', 'proof_result', $2, $3, $4)",
+    )
+    .bind(input.actor.trim())
+    .bind(proof_result_id)
+    .bind(json!({"status": "curator_approved", "document_id": input.document_id}))
+    .bind(input.reason.trim())
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok((
+        StatusCode::CREATED,
+        Json(json!({"proof_result_id": proof_result_id})),
+    ))
+}
+
+fn validate_curated_proof(input: &CreateCuratedProof) -> Result<(), ApiError> {
+    if !matches!(
+        input.result_kind.as_str(),
+        "progress"
+            | "preservation"
+            | "progress_and_preservation"
+            | "type_soundness"
+            | "subject_reduction"
+            | "semantic_soundness"
+            | "logical_relation_soundness"
+            | "other"
+    ) {
+        return Err(ApiError::BadRequest("invalid result_kind".into()));
+    }
+    if input.proof_method.as_deref().is_some_and(|method| {
+        !matches!(
+            method,
+            "syntactic"
+                | "semantic"
+                | "logical_relations"
+                | "reducibility"
+                | "step_indexed"
+                | "mechanized"
+                | "mixed"
+                | "other"
+        )
+    }) {
+        return Err(ApiError::BadRequest("invalid proof_method".into()));
+    }
+    if input.statement_summary.trim().is_empty() || input.statement_summary.len() > 1000 {
+        return Err(ApiError::BadRequest(
+            "statement_summary must contain 1-1000 characters".into(),
+        ));
+    }
+    if input.evidence_paraphrase.trim().is_empty() || input.evidence_paraphrase.len() > 500 {
+        return Err(ApiError::BadRequest(
+            "evidence_paraphrase must contain 1-500 characters".into(),
+        ));
+    }
+    if input.actor.trim().is_empty() || input.reason.trim().is_empty() {
+        return Err(ApiError::BadRequest("actor and reason are required".into()));
+    }
+    let allowed_obligations = [
+        "progress",
+        "preservation",
+        "type_soundness",
+        "canonical_forms",
+        "substitution",
+        "weakening",
+        "other",
+    ];
+    if input.obligations.is_empty()
+        || input
+            .obligations
+            .iter()
+            .any(|value| !allowed_obligations.contains(&value.as_str()))
+        || input
+            .obligations
+            .iter()
+            .enumerate()
+            .any(|(index, value)| input.obligations[..index].contains(value))
+    {
+        return Err(ApiError::BadRequest("invalid proof obligations".into()));
+    }
+    if input.page_start < 1 || input.page_end.is_some_and(|page| page < input.page_start) {
+        return Err(ApiError::BadRequest("invalid page range".into()));
+    }
+    if input.char_start.is_some_and(|offset| offset < 0)
+        || input.char_end.is_some_and(|offset| offset < 0)
+        || matches!((input.char_start, input.char_end), (Some(start), Some(end)) if end < start)
+    {
+        return Err(ApiError::BadRequest("invalid character range".into()));
+    }
+    if input.content_sha256.as_ref().is_some_and(|digest| {
+        digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+    }) {
+        return Err(ApiError::BadRequest("invalid content_sha256".into()));
+    }
+    Ok(())
+}
+
+#[derive(Serialize, FromRow)]
+struct TimelineEntry {
+    work_id: Uuid,
+    title: String,
+    publication_year: Option<i32>,
+    doi: Option<String>,
+    proof_result_id: Uuid,
+    theorem_name: Option<String>,
+    result_kind: String,
+    proof_method: Option<String>,
+    statement_summary: String,
+}
+
+async fn timeline(
+    State(state): State<AppState>,
+    Query(page): Query<Pagination>,
+) -> Result<Json<Vec<TimelineEntry>>, ApiError> {
+    let entries = sqlx::query_as::<_, TimelineEntry>(
+        "SELECT w.id AS work_id, w.title, w.publication_year, w.doi, \
+         pr.id AS proof_result_id, pr.theorem_name, pr.result_kind, pr.proof_method, \
+         pr.statement_summary FROM proof_results pr JOIN works w ON w.id = pr.work_id \
+         WHERE pr.status = 'curator_approved' \
+         ORDER BY w.publication_year NULLS LAST, w.title, pr.id LIMIT $1 OFFSET $2",
+    )
+    .bind(page.limit.clamp(1, 200))
+    .bind(page.offset.max(0))
+    .fetch_all(&state.db)
+    .await?;
+    Ok(Json(entries))
+}
+
+#[derive(Deserialize)]
+struct CreateExport {
+    requested_by: String,
+}
+
+#[derive(Serialize, FromRow)]
+struct ExportRecord {
+    id: Uuid,
+    export_kind: String,
+    status: String,
+    object_key: Option<String>,
+    sha256: Option<String>,
+    row_count: Option<i64>,
+    requested_by: String,
+    error: Option<String>,
+    created_at: String,
+    finished_at: Option<String>,
+}
+
+async fn create_export(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(input): Json<CreateExport>,
+) -> Result<(StatusCode, Json<ExportRecord>), ApiError> {
+    require_curator(&state, &headers)?;
+    if input.requested_by.trim().is_empty() {
+        return Err(ApiError::BadRequest("requested_by is required".into()));
+    }
+    let mut tx = state.db.begin().await?;
+    let record = sqlx::query_as::<_, ExportRecord>(
+        "INSERT INTO exports (export_kind, requested_by) \
+         VALUES ('approved_proofs_parquet', $1) \
+         RETURNING id, export_kind, status::text AS status, object_key, sha256, row_count, \
+         requested_by, error, created_at::text AS created_at, finished_at::text AS finished_at",
+    )
+    .bind(input.requested_by.trim())
+    .fetch_one(&mut *tx)
+    .await?;
+    sqlx::query(
+        "INSERT INTO jobs (job_type, idempotency_key, payload) \
+         VALUES ('export_approved_proofs_parquet', $1, $2)",
+    )
+    .bind(format!("export:approved-proofs:parquet:{}", record.id))
+    .bind(json!({"export_id": record.id}))
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok((StatusCode::ACCEPTED, Json(record)))
+}
+
+async fn get_export(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<Uuid>,
+) -> Result<Json<ExportRecord>, ApiError> {
+    require_curator(&state, &headers)?;
+    let record = sqlx::query_as::<_, ExportRecord>(
+        "SELECT id, export_kind, status::text AS status, object_key, sha256, row_count, \
+         requested_by, error, created_at::text AS created_at, finished_at::text AS finished_at \
+         FROM exports WHERE id = $1",
+    )
+    .bind(id)
+    .fetch_optional(&state.db)
+    .await?
+    .ok_or(ApiError::NotFound)?;
+    Ok(Json(record))
 }
 
 #[derive(Deserialize)]
