@@ -35,6 +35,11 @@ page and document embeddings use Zarr under `/data/zarr`. Neither is canonical.
 
 The worker uses deterministic scikit-learn hashing vectors for document
 similarity and character n-gram TF-IDF for work/discovery entity resolution.
+Bibliographic candidates are additionally ranked by a versioned, deterministic
+local metadata classifier. It promotes high-confidence records only as
+unreviewed candidate works, moves obvious noise to a reversible screened state,
+and leaves ambiguous records for human review. Proof results and historical
+claims remain machine candidates until a curator verifies primary evidence.
 PostgreSQL keeps the compact document vector and review queues; Zarr keeps the
 reproducible page-level arrays. No vector database or remote model service is
 part of the deployment.
