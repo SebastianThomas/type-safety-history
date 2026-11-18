@@ -55,6 +55,7 @@ jobs:
       - uses: astral-sh/setup-uv@v7
         with: { enable-cache: true }
       - run: uv sync --project ml --all-groups
+      - run: uv run --project ml ruff format --check scripts ml
       - run: uv run --project ml ruff check ml
       - run: uv run --project ml ruff check scripts
       - run: uv run --project ml pytest
@@ -135,7 +136,9 @@ jobs:
           severity: HIGH,CRITICAL
           exit-code: "1"
           ignore-unfixed: true
+          version: v0.76.2
       - name: Generate SPDX SBOM
+        if: always()
         uses: anchore/sbom-action@v0.24.3
         with:
           path: .

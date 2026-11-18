@@ -31,6 +31,7 @@ services:
       RUST_LOG: type_safety_history_api=info,tower_http=info
       CURATOR_TOKEN: ${CURATOR_TOKEN:?set CURATOR_TOKEN in .env}
       CROSSREF_MAILTO: ${CROSSREF_MAILTO:?set CROSSREF_MAILTO in .env}
+      OPENALEX_API_KEY: ${OPENALEX_API_KEY:-}
     ports:
       - "8080:8080"
     volumes:

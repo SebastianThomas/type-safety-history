@@ -1,7 +1,8 @@
 use axum::{
     Json, Router,
     extract::{Query, State},
-    response::Html,
+    http::{StatusCode, header},
+    response::{Html, IntoResponse},
     routing::get,
 };
 use serde::{Deserialize, Serialize};
@@ -14,6 +15,7 @@ pub(crate) fn router() -> Router<AppState> {
     Router::new()
         .route("/api/v1/stats/overview", get(overview))
         .route("/api/v1/stats/evolution", get(evolution))
+        .route("/metrics", get(metrics))
         .route("/dashboard", get(dashboard))
 }
 
@@ -76,6 +78,63 @@ async fn overview(State(state): State<AppState>) -> Result<Json<Value>, ApiError
             "works": "Canonical, non-merged scholarly works."
         }
     })))
+}
+
+async fn metrics(State(state): State<AppState>) -> Result<impl IntoResponse, ApiError> {
+    let counts = load_overview(&state).await?;
+    let values = [
+        ("type_safety_history_works", counts.works),
+        ("type_safety_history_discovery_total", counts.discovered),
+        (
+            "type_safety_history_discovery_pending",
+            counts.discovery_pending,
+        ),
+        (
+            "type_safety_history_proof_candidates",
+            counts.proof_candidates,
+        ),
+        (
+            "type_safety_history_proofs_approved",
+            counts.proofs_approved,
+        ),
+        (
+            "type_safety_history_documents_active",
+            counts.active_documents,
+        ),
+        (
+            "type_safety_history_documents_taken_down",
+            counts.documents_taken_down,
+        ),
+        (
+            "type_safety_history_duplicate_suggestions",
+            counts.duplicate_suggestions,
+        ),
+        (
+            "type_safety_history_entity_suggestions",
+            counts.entity_suggestions,
+        ),
+        ("type_safety_history_jobs_active", counts.queued_jobs),
+        (
+            "type_safety_history_jobs_dead_letter",
+            counts.dead_letter_jobs,
+        ),
+    ];
+    let body = values
+        .iter()
+        .map(|(name, value)| {
+            format!(
+                "# TYPE {name} gauge\n# HELP {name} Current database-derived corpus state.\n{name} {value}\n"
+            )
+        })
+        .collect::<String>();
+    Ok((
+        StatusCode::OK,
+        [(
+            header::CONTENT_TYPE,
+            "text/plain; version=0.0.4; charset=utf-8",
+        )],
+        body,
+    ))
 }
 
 #[derive(Deserialize)]
@@ -187,7 +246,7 @@ th,td{{text-align:right;padding:8px 10px;border-bottom:1px solid var(--line)}} t
 .legend{{display:flex;gap:18px;flex-wrap:wrap;font-size:13px;color:var(--muted);margin:8px 0 16px}} .dot{{display:inline-block;width:9px;height:9px;border-radius:50%;margin-right:5px}}
 @media(max-width:800px){{.grid{{grid-template-columns:repeat(2,1fr)}}header{{display:block}}.stamp{{text-align:left;margin-top:8px}}.funnel{{grid-template-columns:1fr 1fr}}}}
 </style></head><body><main>
-<header><div><h1>Type Safety History</h1><p>Evidence-backed corpus state and research throughput.</p></div>
+<header><div><h1>Type Safety History</h1><p>Evidence-backed corpus state and research throughput.</p><p><a href="/curate">Curator workspace</a> · <a href="/docs">API docs</a></p></div>
 <p class="stamp">Auto-refreshes every 60 seconds<br>365-day cumulative view</p></header>
 <section class="grid">
 <div class="card"><div class="label">Canonical works</div><div class="value">{works}</div><p>Non-merged records</p></div>

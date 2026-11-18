@@ -63,6 +63,12 @@ spec:
               valueFrom: { secretKeyRef: { name: type-safety-history-config, key: curator-token } }
             - name: CROSSREF_MAILTO
               valueFrom: { secretKeyRef: { name: type-safety-history-config, key: crossref-mailto } }
+            - name: OPENALEX_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: type-safety-history-config
+                  key: openalex-api-key
+                  optional: true
             - name: DATABASE_URL
               valueFrom: { secretKeyRef: { name: type-safety-history-db-app, key: uri } }
           volumeMounts:

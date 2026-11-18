@@ -1,4 +1,7 @@
-use std::path::{Component, Path};
+use std::{
+    path::{Component, Path},
+    time::Duration,
+};
 
 use axum::{
     Json, Router,
@@ -16,7 +19,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use uuid::Uuid;
 
 use crate::AppState;
-use crate::auth::require_curator;
+use crate::auth::{require_curator, require_viewer};
 use crate::crossref::CrossrefError;
 
 pub(crate) fn router() -> Router<AppState> {
@@ -29,6 +32,19 @@ pub(crate) fn router() -> Router<AppState> {
         .route("/api/v1/documents/upload", post(upload_document))
         .route("/api/v1/imports/crossref", post(import_crossref))
         .route("/api/v1/discovery/crossref", post(discover_crossref))
+        .route("/api/v1/discovery/openalex", post(discover_openalex))
+        .route(
+            "/api/v1/discovery/schedules",
+            get(list_discovery_schedules).post(create_discovery_schedule),
+        )
+        .route(
+            "/api/v1/discovery/schedules/{id}/status",
+            post(set_discovery_schedule_status),
+        )
+        .route(
+            "/api/v1/discovery/schedules/{id}/run",
+            post(run_discovery_schedule),
+        )
         .route(
             "/api/v1/discovery/candidates",
             get(list_discovery_candidates),
@@ -47,6 +63,7 @@ pub(crate) fn router() -> Router<AppState> {
         .merge(crate::auth::router())
         .merge(crate::lifecycle::router())
         .merge(crate::ml::router())
+        .merge(crate::portal::router())
         .merge(crate::research::router())
         .merge(crate::stats::router())
 }
@@ -69,6 +86,7 @@ struct Pagination {
     limit: i64,
     #[serde(default)]
     offset: i64,
+    q: Option<String>,
 }
 
 fn default_limit() -> i64 {
@@ -94,7 +112,14 @@ async fn list_works(
     let works = sqlx::query_as::<_, Work>(
         "SELECT id, title, work_type::text AS work_type, publication_year, doi, \
          review_status::text AS review_status FROM works WHERE merged_into_work_id IS NULL \
-         ORDER BY publication_year NULLS LAST, title LIMIT $1 OFFSET $2",
+         AND ($1::text IS NULL OR title ILIKE '%' || $1 || '%' OR doi ILIKE '%' || $1 || '%') \
+         ORDER BY publication_year NULLS LAST, title LIMIT $2 OFFSET $3",
+    )
+    .bind(
+        page.q
+            .as_deref()
+            .map(str::trim)
+            .filter(|query| !query.is_empty()),
     )
     .bind(limit)
     .bind(offset)
@@ -228,7 +253,20 @@ async fn discover_crossref(
     headers: HeaderMap,
     Json(input): Json<CrossrefDiscoveryRequest>,
 ) -> Result<Json<Value>, ApiError> {
-    require_curator(&state, &headers).await?;
+    let principal = require_curator(&state, &headers).await?;
+    validate_discovery_request(&input)?;
+    Ok(Json(
+        run_crossref_discovery(
+            &state,
+            &input,
+            principal.username(),
+            "Curator-requested Crossref bibliographic search",
+        )
+        .await?,
+    ))
+}
+
+fn validate_discovery_request(input: &CrossrefDiscoveryRequest) -> Result<(), ApiError> {
     let query = input.query.trim();
     if !(3..=200).contains(&query.len()) {
         return Err(ApiError::BadRequest(
@@ -249,6 +287,16 @@ async fn discover_crossref(
             "rows must be between 1 and 100".into(),
         ));
     }
+    Ok(())
+}
+
+async fn run_crossref_discovery(
+    state: &AppState,
+    input: &CrossrefDiscoveryRequest,
+    actor: &str,
+    reason: &str,
+) -> Result<Value, ApiError> {
+    let query = input.query.trim();
     let crossref = state.crossref.as_ref().ok_or(ApiError::NotConfigured(
         "CROSSREF_MAILTO must be configured",
     ))?;
@@ -311,10 +359,128 @@ async fn discover_crossref(
     .await?;
     sqlx::query(
         "INSERT INTO audit_log (actor, action, entity_type, after_value, reason) \
-         VALUES ('crossref-discovery', 'discover', 'discovery_candidate', $1, \
-                 'Curator-requested Crossref bibliographic search')",
+         VALUES ($1, 'discover', 'discovery_candidate', $2, $3)",
     )
+    .bind(actor)
     .bind(json!({
+        "query": query,
+        "from_year": input.from_year,
+        "until_year": input.until_year,
+        "result_count": candidate_ids.len()
+    }))
+    .bind(reason)
+    .execute(&mut *tx)
+    .await?;
+    let resolution_job_id = Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO jobs (id, job_type, idempotency_key, payload) \
+         VALUES ($1, 'resolve_discovery_entities', $2, $3)",
+    )
+    .bind(resolution_job_id)
+    .bind(format!("resolve-discovery-entities:{resolution_job_id}"))
+    .bind(json!({"candidate_ids": candidate_ids}))
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(json!({
+        "candidate_ids": candidate_ids,
+        "result_count": candidate_ids.len(),
+        "resolution_job_id": resolution_job_id
+    }))
+}
+
+async fn discover_openalex(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(input): Json<CrossrefDiscoveryRequest>,
+) -> Result<Json<Value>, ApiError> {
+    let principal = require_curator(&state, &headers).await?;
+    validate_discovery_request(&input)?;
+    Ok(Json(
+        run_openalex_discovery(&state, &input, principal.username()).await?,
+    ))
+}
+
+async fn run_openalex_discovery(
+    state: &AppState,
+    input: &CrossrefDiscoveryRequest,
+    actor: &str,
+) -> Result<Value, ApiError> {
+    let openalex = state.openalex.as_ref().ok_or(ApiError::NotConfigured(
+        "OPENALEX_API_KEY must be configured",
+    ))?;
+    let query = input.query.trim();
+    let discovered = openalex
+        .search(query, input.from_year, input.until_year, input.rows)
+        .await
+        .map_err(|error| match error {
+            crate::openalex::OpenAlexError::RateLimited => {
+                ApiError::Upstream("OpenAlex rate limit or daily budget reached".into())
+            }
+            error => {
+                tracing::warn!(%error, "OpenAlex discovery failed");
+                ApiError::Upstream("OpenAlex discovery failed".into())
+            }
+        })?;
+    let mut tx = state.db.begin().await?;
+    let mut candidate_ids = Vec::with_capacity(discovered.len());
+    for work in discovered {
+        let candidate_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO discovery_candidates \
+             (provider, external_id, title, publication_year, work_type, raw_metadata) \
+             VALUES ('openalex', $1, $2, $3, $4::work_type, $5) \
+             ON CONFLICT (provider, external_id) DO UPDATE SET \
+                 title = EXCLUDED.title, publication_year = EXCLUDED.publication_year, \
+                 work_type = EXCLUDED.work_type, raw_metadata = EXCLUDED.raw_metadata \
+             RETURNING id",
+        )
+        .bind(work.external_id)
+        .bind(work.title)
+        .bind(work.publication_year)
+        .bind(work.work_type)
+        .bind(work.selected_metadata)
+        .fetch_one(&mut *tx)
+        .await?;
+        sqlx::query(
+            "INSERT INTO discovery_hits (candidate_id, query_text, from_year, until_year) \
+             VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING",
+        )
+        .bind(candidate_id)
+        .bind(query)
+        .bind(input.from_year)
+        .bind(input.until_year)
+        .execute(&mut *tx)
+        .await?;
+        candidate_ids.push(candidate_id);
+    }
+    sqlx::query(
+        "INSERT INTO coverage_runs \
+         (provider, query_text, from_year, until_year, requested_rows, result_count, \
+          started_at, finished_at, configuration) \
+         VALUES ('openalex', $1, $2, $3, $4, $5, now(), now(), $6)",
+    )
+    .bind(query)
+    .bind(input.from_year)
+    .bind(input.until_year)
+    .bind(input.rows as i32)
+    .bind(candidate_ids.len() as i32)
+    .bind(json!({
+        "endpoint": "/works",
+        "metadata_license": "CC0-1.0",
+        "selected_fields_only": true,
+        "abstracts_retained": false,
+        "fulltext_retained": false
+    }))
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query(
+        "INSERT INTO audit_log (actor, action, entity_type, after_value, reason) \
+         VALUES ($1, 'discover', 'discovery_candidate', $2, \
+                 'Curator-requested OpenAlex CC0 metadata search')",
+    )
+    .bind(actor)
+    .bind(json!({
+        "provider": "openalex",
         "query": query,
         "from_year": input.from_year,
         "until_year": input.until_year,
@@ -333,11 +499,237 @@ async fn discover_crossref(
     .execute(&mut *tx)
     .await?;
     tx.commit().await?;
-    Ok(Json(json!({
+    Ok(json!({
         "candidate_ids": candidate_ids,
         "result_count": candidate_ids.len(),
         "resolution_job_id": resolution_job_id
-    })))
+    }))
+}
+
+#[derive(Debug, Serialize, FromRow)]
+struct DiscoverySchedule {
+    id: Uuid,
+    provider: String,
+    query_text: String,
+    from_year: i32,
+    until_year: i32,
+    requested_rows: i32,
+    cadence_minutes: i32,
+    enabled: bool,
+    next_run_at: String,
+    last_run_at: Option<String>,
+    created_by: String,
+    created_at: String,
+}
+
+#[derive(Deserialize)]
+struct CreateDiscoverySchedule {
+    query: String,
+    from_year: i32,
+    until_year: i32,
+    #[serde(default = "default_discovery_rows")]
+    rows: u16,
+    cadence_minutes: i32,
+}
+
+async fn list_discovery_schedules(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<DiscoverySchedule>>, ApiError> {
+    require_viewer(&state, &headers).await?;
+    let records = sqlx::query_as::<_, DiscoverySchedule>(
+        "SELECT id, provider, query_text, from_year, until_year, requested_rows, \
+         cadence_minutes, enabled, next_run_at::text AS next_run_at, \
+         last_run_at::text AS last_run_at, created_by, created_at::text AS created_at \
+         FROM discovery_schedules ORDER BY created_at DESC",
+    )
+    .fetch_all(&state.db)
+    .await?;
+    Ok(Json(records))
+}
+
+async fn create_discovery_schedule(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(input): Json<CreateDiscoverySchedule>,
+) -> Result<(StatusCode, Json<DiscoverySchedule>), ApiError> {
+    let principal = require_curator(&state, &headers).await?;
+    let request = CrossrefDiscoveryRequest {
+        query: input.query,
+        from_year: input.from_year,
+        until_year: input.until_year,
+        rows: input.rows,
+    };
+    validate_discovery_request(&request)?;
+    if !(60..=525_600).contains(&input.cadence_minutes) {
+        return Err(ApiError::BadRequest(
+            "cadence_minutes must be between 60 and 525600".into(),
+        ));
+    }
+    let record = sqlx::query_as::<_, DiscoverySchedule>(
+        "INSERT INTO discovery_schedules \
+         (query_text, from_year, until_year, requested_rows, cadence_minutes, created_by) \
+         VALUES ($1, $2, $3, $4, $5, $6) \
+         RETURNING id, provider, query_text, from_year, until_year, requested_rows, \
+         cadence_minutes, enabled, next_run_at::text AS next_run_at, \
+         last_run_at::text AS last_run_at, created_by, created_at::text AS created_at",
+    )
+    .bind(request.query.trim())
+    .bind(request.from_year)
+    .bind(request.until_year)
+    .bind(request.rows as i32)
+    .bind(input.cadence_minutes)
+    .bind(principal.username())
+    .fetch_one(&state.db)
+    .await?;
+    Ok((StatusCode::CREATED, Json(record)))
+}
+
+#[derive(Deserialize)]
+struct SetDiscoveryScheduleStatus {
+    enabled: bool,
+    reason: String,
+}
+
+async fn set_discovery_schedule_status(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<Uuid>,
+    Json(input): Json<SetDiscoveryScheduleStatus>,
+) -> Result<StatusCode, ApiError> {
+    let principal = require_curator(&state, &headers).await?;
+    if input.reason.trim().is_empty() {
+        return Err(ApiError::BadRequest("reason is required".into()));
+    }
+    let mut tx = state.db.begin().await?;
+    let updated = sqlx::query(
+        "UPDATE discovery_schedules SET enabled = $2, \
+         next_run_at = CASE WHEN $2 THEN LEAST(next_run_at, now()) ELSE next_run_at END, \
+         updated_at = now() WHERE id = $1",
+    )
+    .bind(id)
+    .bind(input.enabled)
+    .execute(&mut *tx)
+    .await?;
+    if updated.rows_affected() == 0 {
+        return Err(ApiError::NotFound);
+    }
+    sqlx::query(
+        "INSERT INTO audit_log (actor, action, entity_type, entity_id, after_value, reason) \
+         VALUES ($1, 'set_status', 'discovery_schedule', $2, $3, $4)",
+    )
+    .bind(principal.username())
+    .bind(id)
+    .bind(json!({"enabled": input.enabled}))
+    .bind(input.reason.trim())
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn run_discovery_schedule(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<Uuid>,
+) -> Result<Json<Value>, ApiError> {
+    let principal = require_curator(&state, &headers).await?;
+    let schedule = sqlx::query_as::<_, DiscoverySchedule>(
+        "SELECT id, provider, query_text, from_year, until_year, requested_rows, \
+         cadence_minutes, enabled, next_run_at::text AS next_run_at, \
+         last_run_at::text AS last_run_at, created_by, created_at::text AS created_at \
+         FROM discovery_schedules WHERE id = $1",
+    )
+    .bind(id)
+    .fetch_optional(&state.db)
+    .await?
+    .ok_or(ApiError::NotFound)?;
+    let result = run_crossref_discovery(
+        &state,
+        &schedule_request(&schedule),
+        principal.username(),
+        "Manual execution of a saved Crossref discovery schedule",
+    )
+    .await?;
+    sqlx::query(
+        "UPDATE discovery_schedules SET last_run_at = now(), \
+         next_run_at = now() + make_interval(mins => cadence_minutes), updated_at = now() \
+         WHERE id = $1",
+    )
+    .bind(id)
+    .execute(&state.db)
+    .await?;
+    Ok(Json(result))
+}
+
+fn schedule_request(schedule: &DiscoverySchedule) -> CrossrefDiscoveryRequest {
+    CrossrefDiscoveryRequest {
+        query: schedule.query_text.clone(),
+        from_year: schedule.from_year,
+        until_year: schedule.until_year,
+        rows: schedule.requested_rows as u16,
+    }
+}
+
+pub(crate) async fn run_discovery_scheduler(state: AppState) {
+    if state.crossref.is_none() {
+        return;
+    }
+    let mut ticker = tokio::time::interval(Duration::from_secs(60));
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        ticker.tick().await;
+        for _ in 0..10 {
+            let claimed = sqlx::query_as::<_, DiscoverySchedule>(
+                "WITH due AS ( \
+                   SELECT id FROM discovery_schedules \
+                   WHERE enabled AND next_run_at <= now() \
+                   ORDER BY next_run_at FOR UPDATE SKIP LOCKED LIMIT 1 \
+                 ) \
+                 UPDATE discovery_schedules schedule SET last_run_at = now(), \
+                   next_run_at = now() + make_interval(mins => schedule.cadence_minutes), \
+                   updated_at = now() FROM due WHERE schedule.id = due.id \
+                 RETURNING schedule.id, schedule.provider, schedule.query_text, \
+                   schedule.from_year, schedule.until_year, schedule.requested_rows, \
+                   schedule.cadence_minutes, schedule.enabled, \
+                   schedule.next_run_at::text AS next_run_at, \
+                   schedule.last_run_at::text AS last_run_at, schedule.created_by, \
+                   schedule.created_at::text AS created_at",
+            )
+            .fetch_optional(&state.db)
+            .await;
+            let schedule = match claimed {
+                Ok(Some(schedule)) => schedule,
+                Ok(None) => break,
+                Err(error) => {
+                    tracing::error!(%error, "failed to claim discovery schedule");
+                    break;
+                }
+            };
+            let actor = format!("schedule:{}", schedule.created_by);
+            if let Err(error) = run_crossref_discovery(
+                &state,
+                &schedule_request(&schedule),
+                &actor,
+                "Scheduled Crossref bibliographic search",
+            )
+            .await
+            {
+                tracing::warn!(schedule_id = %schedule.id, %error, "scheduled discovery failed");
+                let _ = sqlx::query(
+                    "INSERT INTO audit_log \
+                     (actor, action, entity_type, entity_id, after_value, reason) \
+                     VALUES ($1, 'scheduled_discovery_failed', 'discovery_schedule', $2, $3, $4)",
+                )
+                .bind(&actor)
+                .bind(schedule.id)
+                .bind(json!({"error": error.to_string()}))
+                .bind("Scheduled Crossref search failed; the next cadence remains scheduled")
+                .execute(&state.db)
+                .await;
+            }
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -373,7 +765,7 @@ async fn list_discovery_candidates(
     headers: HeaderMap,
     Query(page): Query<DiscoveryPagination>,
 ) -> Result<Json<Vec<DiscoveryCandidate>>, ApiError> {
-    require_curator(&state, &headers).await?;
+    require_viewer(&state, &headers).await?;
     if !matches!(page.status.as_str(), "pending" | "imported" | "rejected") {
         return Err(ApiError::BadRequest("invalid discovery status".into()));
     }
@@ -1079,12 +1471,20 @@ async fn list_candidates(
     headers: HeaderMap,
     Query(page): Query<Pagination>,
 ) -> Result<Json<Vec<ProofCandidate>>, ApiError> {
-    require_curator(&state, &headers).await?;
+    require_viewer(&state, &headers).await?;
     let candidates = sqlx::query_as::<_, ProofCandidate>(
         "SELECT id, work_id, theorem_name, result_kind, proof_method, statement_summary, \
          confidence, classifier_version, created_at::text AS created_at \
          FROM proof_results WHERE status = 'machine_candidate' \
-         ORDER BY created_at LIMIT $1 OFFSET $2",
+         AND ($1::text IS NULL OR result_kind ILIKE '%' || $1 || '%' \
+              OR statement_summary ILIKE '%' || $1 || '%') \
+         ORDER BY created_at LIMIT $2 OFFSET $3",
+    )
+    .bind(
+        page.q
+            .as_deref()
+            .map(str::trim)
+            .filter(|query| !query.is_empty()),
     )
     .bind(page.limit.clamp(1, 200))
     .bind(page.offset.max(0))
@@ -1123,7 +1523,7 @@ async fn get_proof_result(
     headers: HeaderMap,
     AxumPath(id): AxumPath<Uuid>,
 ) -> Result<Json<Value>, ApiError> {
-    require_curator(&state, &headers).await?;
+    require_viewer(&state, &headers).await?;
     let result = sqlx::query_as::<_, ProofResultDetail>(
         "SELECT id, work_id, source_document_id, theorem_name, result_kind, proof_method, \
          statement_summary, status::text AS status, confidence, classifier_version \
@@ -1357,7 +1757,15 @@ async fn timeline(
          pr.id AS proof_result_id, pr.theorem_name, pr.result_kind, pr.proof_method, \
          pr.statement_summary FROM proof_results pr JOIN works w ON w.id = pr.work_id \
          WHERE pr.status = 'curator_approved' \
-         ORDER BY w.publication_year NULLS LAST, w.title, pr.id LIMIT $1 OFFSET $2",
+         AND ($1::text IS NULL OR w.title ILIKE '%' || $1 || '%' \
+              OR w.doi ILIKE '%' || $1 || '%' OR pr.result_kind ILIKE '%' || $1 || '%') \
+         ORDER BY w.publication_year NULLS LAST, w.title, pr.id LIMIT $2 OFFSET $3",
+    )
+    .bind(
+        page.q
+            .as_deref()
+            .map(str::trim)
+            .filter(|query| !query.is_empty()),
     )
     .bind(page.limit.clamp(1, 200))
     .bind(page.offset.max(0))
@@ -1419,7 +1827,7 @@ async fn get_export(
     headers: HeaderMap,
     AxumPath(id): AxumPath<Uuid>,
 ) -> Result<Json<ExportRecord>, ApiError> {
-    require_curator(&state, &headers).await?;
+    require_viewer(&state, &headers).await?;
     let record = sqlx::query_as::<_, ExportRecord>(
         "SELECT id, export_kind, status::text AS status, object_key, sha256, row_count, \
          requested_by, error, created_at::text AS created_at, finished_at::text AS finished_at \

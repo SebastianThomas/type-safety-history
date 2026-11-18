@@ -1,6 +1,6 @@
 use axum::{
     Json, Router,
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::{HeaderMap, StatusCode},
     routing::{get, post},
 };
@@ -17,9 +17,13 @@ pub(crate) fn router() -> Router<AppState> {
     Router::new()
         .route("/api/v1/auth/me", get(me))
         .route("/api/v1/admin/users", get(list_users).post(create_user))
-        .route("/api/v1/admin/users/{id}/tokens", post(create_token))
+        .route(
+            "/api/v1/admin/users/{id}/tokens",
+            get(list_tokens).post(create_token),
+        )
         .route("/api/v1/admin/users/{id}/status", post(set_user_status))
         .route("/api/v1/admin/tokens/{id}/revoke", post(revoke_token))
+        .route("/api/v1/audit", get(list_audit))
 }
 
 #[derive(Clone, Debug, Serialize, FromRow)]
@@ -47,6 +51,13 @@ pub(crate) async fn require_curator(
     } else {
         Err(ApiError::Forbidden)
     }
+}
+
+pub(crate) async fn require_viewer(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<Principal, ApiError> {
+    authenticate(state, headers).await
 }
 
 async fn require_admin(state: &AppState, headers: &HeaderMap) -> Result<Principal, ApiError> {
@@ -114,6 +125,35 @@ struct UserRecord {
     created_at: String,
 }
 
+#[derive(Serialize, FromRow)]
+struct TokenRecord {
+    id: Uuid,
+    label: String,
+    token_prefix: String,
+    expires_at: Option<String>,
+    last_used_at: Option<String>,
+    revoked_at: Option<String>,
+    created_at: String,
+}
+
+async fn list_tokens(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(user_id): Path<Uuid>,
+) -> Result<Json<Vec<TokenRecord>>, ApiError> {
+    require_admin(&state, &headers).await?;
+    let tokens = sqlx::query_as::<_, TokenRecord>(
+        "SELECT id, label, token_prefix, expires_at::text AS expires_at, \
+         last_used_at::text AS last_used_at, revoked_at::text AS revoked_at, \
+         created_at::text AS created_at FROM curator_api_tokens \
+         WHERE user_id = $1 ORDER BY created_at DESC",
+    )
+    .bind(user_id)
+    .fetch_all(&state.db)
+    .await?;
+    Ok(Json(tokens))
+}
+
 async fn list_users(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -150,8 +190,19 @@ async fn create_user(
         return Err(ApiError::BadRequest("invalid role".into()));
     }
     let username = input.username.trim().to_ascii_lowercase();
-    if input.display_name.trim().is_empty() {
-        return Err(ApiError::BadRequest("display_name is required".into()));
+    if input.display_name.trim().is_empty()
+        || username.len() < 3
+        || username.len() > 64
+        || !username.bytes().enumerate().all(|(index, byte)| {
+            byte.is_ascii_lowercase()
+                || byte.is_ascii_digit()
+                || (index > 0 && matches!(byte, b'_' | b'-'))
+        })
+    {
+        return Err(ApiError::BadRequest(
+            "username must be 3-64 lowercase letters, digits, underscores or hyphens; display_name is required"
+                .into(),
+        ));
     }
     let mut tx = state.db.begin().await?;
     let id: Uuid = sqlx::query_scalar(
@@ -342,4 +393,74 @@ async fn audit_admin(
     .execute(&mut **tx)
     .await?;
     Ok(())
+}
+
+#[derive(Deserialize)]
+struct AuditQuery {
+    actor: Option<String>,
+    entity_type: Option<String>,
+    action: Option<String>,
+    #[serde(default = "default_audit_limit")]
+    limit: i64,
+    #[serde(default)]
+    offset: i64,
+}
+
+fn default_audit_limit() -> i64 {
+    100
+}
+
+#[derive(Serialize, FromRow)]
+struct AuditRecord {
+    id: i64,
+    actor: String,
+    action: String,
+    entity_type: String,
+    entity_id: Option<Uuid>,
+    before_value: Option<Value>,
+    after_value: Option<Value>,
+    reason: Option<String>,
+    occurred_at: String,
+}
+
+async fn list_audit(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuditQuery>,
+) -> Result<Json<Vec<AuditRecord>>, ApiError> {
+    require_curator(&state, &headers).await?;
+    let records = sqlx::query_as::<_, AuditRecord>(
+        "SELECT id, actor, action, entity_type, entity_id, before_value, after_value, \
+         reason, occurred_at::text AS occurred_at FROM audit_log \
+         WHERE ($1::text IS NULL OR actor = $1) \
+           AND ($2::text IS NULL OR entity_type = $2) \
+           AND ($3::text IS NULL OR action = $3) \
+         ORDER BY occurred_at DESC, id DESC LIMIT $4 OFFSET $5",
+    )
+    .bind(
+        query
+            .actor
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty()),
+    )
+    .bind(
+        query
+            .entity_type
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty()),
+    )
+    .bind(
+        query
+            .action
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty()),
+    )
+    .bind(query.limit.clamp(1, 500))
+    .bind(query.offset.max(0))
+    .fetch_all(&state.db)
+    .await?;
+    Ok(Json(records))
 }

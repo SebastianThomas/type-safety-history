@@ -64,6 +64,32 @@ become a canonical work or proof: a curator must separately import its DOI,
 after which the candidate is linked to the resulting work, or reject it with an
 audited reason.
 
+Saved searches use the same endpoint, field selection, contact identification
+and in-process rate limiter. Their cadence cannot be shorter than one hour.
+Scheduling does not grant permission to download linked documents: every PDF
+still requires a separate curator-recorded rights decision.
+
+## Optional adapter: OpenAlex Works API
+
+- Endpoint: `https://api.openalex.org/works` with `search`, publication-date
+  filters, `per_page`, and an explicit `select` list.
+- Authentication: `OPENALEX_API_KEY` is required by this application so usage
+  and the provider's daily service budget remain attributable and bounded.
+- Rate: requests are serialized in-process and limited to one per second; each
+  application call retrieves at most 100 records.
+- Retained fields: OpenAlex ID, DOI, title, publication year, work type,
+  authorship identifiers/names and primary-location landing-page/licence
+  metadata.
+- Excluded fields: abstracts, inverted abstracts, PDF/full-text URLs and full
+  text. OpenAlex discovery never authorizes acquisition of a linked document.
+- Licence: OpenAlex publishes its catalog metadata under CC0. The adapter marks
+  its selected metadata `CC0-1.0` while preserving any separate location-level
+  licence only as a discovery fact requiring curator verification.
+- Documentation and terms:
+  `https://help.openalex.org/api/`,
+  `https://help.openalex.org/data/how-its-built/`, and
+  `https://openalex.org/OpenAlex_termsofservice.pdf`.
+
 ## Local ML
 
 No document content or embedding is sent to a hosted inference or OCR service.

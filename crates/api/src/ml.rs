@@ -9,7 +9,11 @@ use serde_json::{Value, json};
 use sqlx::FromRow;
 use uuid::Uuid;
 
-use crate::{AppState, auth::require_curator, routes::ApiError};
+use crate::{
+    AppState,
+    auth::{require_curator, require_viewer},
+    routes::ApiError,
+};
 
 pub(crate) fn router() -> Router<AppState> {
     Router::new()
@@ -35,6 +39,11 @@ pub(crate) fn router() -> Router<AppState> {
             "/api/v1/ml/evaluations",
             get(list_evaluations).post(queue_evaluation),
         )
+        .route("/api/v1/ml/pipeline-runs", get(list_pipeline_runs))
+        .route(
+            "/api/v1/ml/jobs/reprocess-documents",
+            post(queue_document_reprocessing),
+        )
         .route("/api/v1/ml/jobs/{kind}", post(queue_ml_job))
 }
 
@@ -50,7 +59,7 @@ async fn document_similarities(
     headers: HeaderMap,
     Path(id): Path<Uuid>,
 ) -> Result<Json<Vec<DocumentSimilarity>>, ApiError> {
-    require_curator(&state, &headers).await?;
+    require_viewer(&state, &headers).await?;
     let rows = sqlx::query_as::<_, DocumentSimilarity>(
         "SELECT CASE WHEN left_document_id = $1 THEN right_document_id \
                 ELSE left_document_id END AS document_id, score, algorithm \
@@ -92,7 +101,7 @@ async fn citation_candidates(
     headers: HeaderMap,
     Query(page): Query<Page>,
 ) -> Result<Json<Vec<CitationCandidate>>, ApiError> {
-    require_curator(&state, &headers).await?;
+    require_viewer(&state, &headers).await?;
     let rows = sqlx::query_as::<_, CitationCandidate>(
         "SELECT id, citing_work_id, source_document_id, page, cited_doi, \
          context_sha256, status::text AS status FROM citation_candidates \
@@ -191,7 +200,7 @@ async fn entity_resolution_suggestions(
     headers: HeaderMap,
     Query(page): Query<Page>,
 ) -> Result<Json<Vec<EntitySuggestion>>, ApiError> {
-    require_curator(&state, &headers).await?;
+    require_viewer(&state, &headers).await?;
     let rows = sqlx::query_as::<_, EntitySuggestion>(
         "SELECT id, discovery_candidate_id, work_id, score, method, rationale \
          FROM entity_resolution_suggestions WHERE status = 'pending' \
@@ -345,12 +354,44 @@ struct Evaluation {
     created_at: String,
 }
 
+#[derive(Serialize, FromRow)]
+struct PipelineRun {
+    id: Uuid,
+    pipeline_name: String,
+    pipeline_version: String,
+    model_name: Option<String>,
+    model_version: Option<String>,
+    model_sha256: Option<String>,
+    model_license: Option<String>,
+    started_at: String,
+    finished_at: Option<String>,
+    configuration: Value,
+}
+
+async fn list_pipeline_runs(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(page): Query<Page>,
+) -> Result<Json<Vec<PipelineRun>>, ApiError> {
+    require_viewer(&state, &headers).await?;
+    let rows = sqlx::query_as::<_, PipelineRun>(
+        "SELECT id, pipeline_name, pipeline_version, model_name, model_version, model_sha256, \
+         model_license, started_at::text AS started_at, finished_at::text AS finished_at, \
+         configuration FROM pipeline_runs ORDER BY started_at DESC LIMIT $1 OFFSET $2",
+    )
+    .bind(page.limit.clamp(1, 500))
+    .bind(page.offset.max(0))
+    .fetch_all(&state.db)
+    .await?;
+    Ok(Json(rows))
+}
+
 async fn list_evaluations(
     State(state): State<AppState>,
     headers: HeaderMap,
     Query(page): Query<Page>,
 ) -> Result<Json<Vec<Evaluation>>, ApiError> {
-    require_curator(&state, &headers).await?;
+    require_viewer(&state, &headers).await?;
     let rows = sqlx::query_as::<_, Evaluation>(
         "SELECT id, pipeline_version, labelled_examples, true_positives, false_positives, \
          false_negatives, precision, recall, f1, details, created_at::text AS created_at \
@@ -369,6 +410,53 @@ async fn queue_evaluation(
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
     require_curator(&state, &headers).await?;
     queue_job(&state, "evaluate_local_classifier").await
+}
+
+#[derive(Deserialize)]
+struct ReprocessDocuments {
+    reason: String,
+}
+
+async fn queue_document_reprocessing(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(input): Json<ReprocessDocuments>,
+) -> Result<(StatusCode, Json<Value>), ApiError> {
+    let principal = require_curator(&state, &headers).await?;
+    if input.reason.trim().is_empty() {
+        return Err(ApiError::BadRequest("reason is required".into()));
+    }
+    let batch_id = Uuid::now_v7();
+    let mut tx = state.db.begin().await?;
+    let queued: i64 = sqlx::query_scalar(
+        "WITH inserted AS ( \
+           INSERT INTO jobs (job_type, idempotency_key, payload) \
+           SELECT 'extract_document', 'reprocess:' || d.id::text || ':' || $1::text, \
+                  jsonb_build_object('document_id', d.id, 'object_key', d.object_key, \
+                                     'reprocess_batch_id', $1) \
+           FROM documents d WHERE d.status = 'active' AND d.ml_use_permitted \
+           RETURNING 1 \
+         ) SELECT count(*) FROM inserted",
+    )
+    .bind(batch_id)
+    .fetch_one(&mut *tx)
+    .await?;
+    sqlx::query(
+        "INSERT INTO audit_log \
+         (actor, action, entity_type, entity_id, after_value, reason) \
+         VALUES ($1, 'queue_reprocessing', 'pipeline_batch', $2, $3, $4)",
+    )
+    .bind(principal.username())
+    .bind(batch_id)
+    .bind(json!({"queued_documents": queued}))
+    .bind(input.reason.trim())
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(json!({"batch_id": batch_id, "queued_documents": queued})),
+    ))
 }
 
 async fn queue_ml_job(

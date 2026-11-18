@@ -1,0 +1,64 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "Type Safety History API",
+    "version": "0.1.0",
+    "description": "Evidence-backed type-safety proof history. Machine output remains a review candidate."
+  },
+  "servers": [{"url": "/"}],
+  "components": {
+    "securitySchemes": {"bearerAuth": {"type": "http", "scheme": "bearer"}},
+    "parameters": {
+      "Limit": {"name": "limit", "in": "query", "schema": {"type": "integer", "minimum": 1, "maximum": 500, "default": 50}},
+      "Offset": {"name": "offset", "in": "query", "schema": {"type": "integer", "minimum": 0, "default": 0}},
+      "Id": {"name": "id", "in": "path", "required": true, "schema": {"type": "string", "format": "uuid"}}
+    },
+    "schemas": {
+      "Error": {"type": "object", "required": ["error"], "properties": {"error": {"type": "string"}}},
+      "Decision": {"type": "object", "required": ["decision", "reason"], "properties": {"decision": {"type": "string"}, "reason": {"type": "string"}}}
+    }
+  },
+  "paths": {
+    "/health/live": {"get": {"summary": "Process liveness", "responses": {"200": {"description": "Live"}}}},
+    "/health/ready": {"get": {"summary": "Database and volume readiness", "responses": {"200": {"description": "Ready"}}}},
+    "/api/v1/auth/me": {"get": {"summary": "Current principal", "security": [{"bearerAuth": []}], "responses": {"200": {"description": "Authenticated principal"}}}},
+    "/api/v1/admin/users": {"get": {"summary": "List curator accounts", "security": [{"bearerAuth": []}], "responses": {"200": {"description": "Accounts"}}}, "post": {"summary": "Create account", "security": [{"bearerAuth": []}], "responses": {"201": {"description": "Created"}}}},
+    "/api/v1/admin/users/{id}/tokens": {"parameters": [{"$ref": "#/components/parameters/Id"}], "get": {"summary": "List token metadata", "security": [{"bearerAuth": []}], "responses": {"200": {"description": "Tokens without secrets"}}}, "post": {"summary": "Issue token", "security": [{"bearerAuth": []}], "responses": {"201": {"description": "Token shown once"}}}},
+    "/api/v1/admin/users/{id}/status": {"parameters": [{"$ref": "#/components/parameters/Id"}], "post": {"summary": "Activate or deactivate account", "security": [{"bearerAuth": []}], "responses": {"204": {"description": "Updated"}}}},
+    "/api/v1/admin/tokens/{id}/revoke": {"parameters": [{"$ref": "#/components/parameters/Id"}], "post": {"summary": "Revoke token", "security": [{"bearerAuth": []}], "responses": {"204": {"description": "Revoked"}}}},
+    "/api/v1/audit": {"get": {"summary": "Query audit trail", "security": [{"bearerAuth": []}], "parameters": [{"$ref": "#/components/parameters/Limit"}, {"$ref": "#/components/parameters/Offset"}], "responses": {"200": {"description": "Audit events"}}}},
+    "/api/v1/works": {"get": {"summary": "Search canonical works", "parameters": [{"name": "q", "in": "query", "schema": {"type": "string"}}, {"$ref": "#/components/parameters/Limit"}, {"$ref": "#/components/parameters/Offset"}], "responses": {"200": {"description": "Works"}}}, "post": {"summary": "Create work", "security": [{"bearerAuth": []}], "responses": {"201": {"description": "Created"}}}},
+    "/api/v1/works/{id}": {"parameters": [{"$ref": "#/components/parameters/Id"}], "get": {"summary": "Get canonical work or merge redirect", "responses": {"200": {"description": "Work"}}}},
+    "/api/v1/works/{id}/research": {"parameters": [{"$ref": "#/components/parameters/Id"}], "get": {"summary": "Aggregate research record", "security": [{"bearerAuth": []}], "responses": {"200": {"description": "Research record"}}}},
+    "/api/v1/imports/crossref": {"post": {"summary": "Import DOI metadata from Crossref", "security": [{"bearerAuth": []}], "responses": {"200": {"description": "Imported or cached"}}}},
+    "/api/v1/discovery/crossref": {"post": {"summary": "Run a recorded Crossref discovery query", "security": [{"bearerAuth": []}], "responses": {"200": {"description": "Discovery run"}}}},
+    "/api/v1/discovery/openalex": {"post": {"summary": "Search selected CC0 OpenAlex metadata", "security": [{"bearerAuth": []}], "responses": {"200": {"description": "Discovery run"}}}},
+    "/api/v1/discovery/schedules": {"get": {"summary": "List saved Crossref searches", "security": [{"bearerAuth": []}], "responses": {"200": {"description": "Schedules"}}}, "post": {"summary": "Create recurring Crossref search", "security": [{"bearerAuth": []}], "responses": {"201": {"description": "Created"}}}},
+    "/api/v1/discovery/schedules/{id}/status": {"parameters": [{"$ref": "#/components/parameters/Id"}], "post": {"summary": "Enable or disable discovery schedule", "security": [{"bearerAuth": []}], "responses": {"204": {"description": "Updated"}}}},
+    "/api/v1/discovery/schedules/{id}/run": {"parameters": [{"$ref": "#/components/parameters/Id"}], "post": {"summary": "Run saved discovery immediately", "security": [{"bearerAuth": []}], "responses": {"200": {"description": "Discovery result"}}}},
+    "/api/v1/discovery/candidates": {"get": {"summary": "List discovery candidates", "security": [{"bearerAuth": []}], "parameters": [{"name": "status", "in": "query", "schema": {"type": "string", "default": "pending"}}, {"$ref": "#/components/parameters/Limit"}, {"$ref": "#/components/parameters/Offset"}], "responses": {"200": {"description": "Candidates"}}}},
+    "/api/v1/discovery/candidates/{id}/reject": {"parameters": [{"$ref": "#/components/parameters/Id"}], "post": {"summary": "Reject discovery candidate", "security": [{"bearerAuth": []}], "responses": {"204": {"description": "Rejected"}}}},
+    "/api/v1/documents/upload": {"post": {"summary": "Upload a rights-reviewed local PDF", "security": [{"bearerAuth": []}], "responses": {"201": {"description": "Stored and queued"}}}},
+    "/api/v1/documents/{id}/takedown": {"parameters": [{"$ref": "#/components/parameters/Id"}], "post": {"summary": "Audited idempotent takedown", "security": [{"bearerAuth": []}], "responses": {"204": {"description": "Taken down"}}}},
+    "/api/v1/proof-results/candidates": {"get": {"summary": "List machine proof candidates", "security": [{"bearerAuth": []}], "parameters": [{"$ref": "#/components/parameters/Limit"}, {"$ref": "#/components/parameters/Offset"}], "responses": {"200": {"description": "Candidates"}}}},
+    "/api/v1/proof-results/{id}": {"parameters": [{"$ref": "#/components/parameters/Id"}], "get": {"summary": "Proof result and evidence", "security": [{"bearerAuth": []}], "responses": {"200": {"description": "Proof result"}}}},
+    "/api/v1/proof-results/{id}/review": {"parameters": [{"$ref": "#/components/parameters/Id"}], "post": {"summary": "Review proof candidate", "security": [{"bearerAuth": []}], "responses": {"204": {"description": "Reviewed"}}}},
+    "/api/v1/proof-results/curated": {"post": {"summary": "Create evidence-backed curated proof", "security": [{"bearerAuth": []}], "responses": {"201": {"description": "Created"}}}},
+    "/api/v1/citation-candidates": {"get": {"summary": "List citation candidates", "security": [{"bearerAuth": []}], "responses": {"200": {"description": "Candidates"}}}},
+    "/api/v1/citation-candidates/{id}/resolve": {"parameters": [{"$ref": "#/components/parameters/Id"}], "post": {"summary": "Resolve citation candidate", "security": [{"bearerAuth": []}], "responses": {"204": {"description": "Resolved"}}}},
+    "/api/v1/entity-resolution-suggestions": {"get": {"summary": "List entity matches", "security": [{"bearerAuth": []}], "responses": {"200": {"description": "Suggestions"}}}},
+    "/api/v1/entity-resolution-suggestions/{id}/resolve": {"parameters": [{"$ref": "#/components/parameters/Id"}], "post": {"summary": "Resolve entity match", "security": [{"bearerAuth": []}], "responses": {"204": {"description": "Resolved"}}}},
+    "/api/v1/duplicate-suggestions": {"get": {"summary": "List duplicate suggestions", "security": [{"bearerAuth": []}], "responses": {"200": {"description": "Suggestions"}}}},
+    "/api/v1/duplicate-suggestions/{id}/resolve": {"parameters": [{"$ref": "#/components/parameters/Id"}], "post": {"summary": "Resolve and optionally merge duplicate", "security": [{"bearerAuth": []}], "responses": {"204": {"description": "Resolved"}}}},
+    "/api/v1/ml/labels": {"post": {"summary": "Create curator evaluation label", "security": [{"bearerAuth": []}], "responses": {"201": {"description": "Labelled"}}}},
+    "/api/v1/ml/pipeline-runs": {"get": {"summary": "List reproducible local pipeline runs", "security": [{"bearerAuth": []}], "responses": {"200": {"description": "Pipeline runs"}}}},
+    "/api/v1/ml/jobs/reprocess-documents": {"post": {"summary": "Queue all permitted active documents for local reprocessing", "security": [{"bearerAuth": []}], "responses": {"202": {"description": "Batch queued"}}}},
+    "/api/v1/ml/evaluations": {"get": {"summary": "List local evaluation runs", "security": [{"bearerAuth": []}], "responses": {"200": {"description": "Evaluations"}}}, "post": {"summary": "Queue local evaluation", "security": [{"bearerAuth": []}], "responses": {"202": {"description": "Queued"}}}},
+    "/api/v1/stats/overview": {"get": {"summary": "Current corpus state", "responses": {"200": {"description": "Counts and coverage"}}}},
+    "/api/v1/stats/evolution": {"get": {"summary": "Corpus evolution", "parameters": [{"name": "days", "in": "query", "schema": {"type": "integer", "minimum": 1, "maximum": 3650}}], "responses": {"200": {"description": "Daily series"}}}},
+    "/api/v1/timeline": {"get": {"summary": "Public approved-proof timeline", "responses": {"200": {"description": "Approved proofs"}}}},
+    "/api/v1/exports": {"post": {"summary": "Queue approved-proof Parquet export", "security": [{"bearerAuth": []}], "responses": {"202": {"description": "Queued"}}}},
+    "/api/v1/exports/{id}": {"parameters": [{"$ref": "#/components/parameters/Id"}], "get": {"summary": "Get export status", "security": [{"bearerAuth": []}], "responses": {"200": {"description": "Export"}}}},
+    "/metrics": {"get": {"summary": "Prometheus corpus and queue metrics", "responses": {"200": {"description": "Prometheus text format"}}}}
+  }
+}

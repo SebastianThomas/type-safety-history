@@ -14,13 +14,19 @@
    ```bash
    kubectl -n type-safety-history create secret generic type-safety-history-config \
      --from-literal=curator-token='<long-random-token>' \
-     --from-literal=crossref-mailto='<monitored-research-email>'
+     --from-literal=crossref-mailto='<monitored-research-email>' \
+     --from-literal=openalex-api-key='<optional-openalex-key>'
    ```
 
 Apply `db/` first and wait for the CNPG cluster to become ready. Then apply
 `deploy/`. Both Kustomizations include the same idempotent Namespace definition.
 The API runs migrations before it becomes ready; the worker waits for
 the schema and claims work afterward.
+
+The Kubernetes pod and every container use the runtime-default seccomp profile,
+drop Linux capabilities and use immutable root filesystems. A bounded
+`emptyDir` provides `/tmp`; canonical and derived application data remain on
+the local PVC.
 
 After first start, use the bootstrap token to create named administrators and
 curators through `/api/v1/admin/users` and issue separate tokens through
@@ -29,6 +35,9 @@ manager. The plaintext is returned only once. Deactivate departed users or
 revoke individual tokens through the admin API; reserve the bootstrap secret
 for recovery and rotate it through the Kubernetes Secret. Do not use shared
 named tokens: the authenticated username is the authoritative audit identity.
+Use viewer tokens for read-only research access, curator tokens for review, and
+admin tokens only for account operations. Review account and token activity via
+`/api/v1/audit` and `/api/v1/admin/users/{id}/tokens`.
 
 Load the curated starting queue after migrations:
 

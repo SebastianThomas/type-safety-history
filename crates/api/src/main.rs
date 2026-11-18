@@ -3,6 +3,8 @@ mod crossref;
 mod integrity;
 mod lifecycle;
 mod ml;
+mod openalex;
+mod portal;
 mod research;
 mod routes;
 mod seed;
@@ -29,6 +31,7 @@ pub(crate) struct AppState {
     pub data_root: Arc<PathBuf>,
     pub curator_token: Option<Arc<str>>,
     pub crossref: Option<crossref::CrossrefClient>,
+    pub openalex: Option<openalex::OpenAlexClient>,
 }
 
 #[tokio::main]
@@ -91,12 +94,23 @@ async fn main() -> Result<()> {
         )?),
         _ => None,
     };
+    let openalex = match env::var("OPENALEX_API_KEY") {
+        Ok(api_key) if !api_key.trim().is_empty() => Some(openalex::OpenAlexClient::new(
+            api_key,
+            env::var("OPENALEX_USER_AGENT").unwrap_or_else(|_| {
+                "type-safety-history/0.1 (+https://example.invalid/type-safety-history)".into()
+            }),
+        )?),
+        _ => None,
+    };
     let state = AppState {
         db,
         data_root: Arc::new(data_root),
         curator_token,
         crossref,
+        openalex,
     };
+    let discovery_scheduler = tokio::spawn(routes::run_discovery_scheduler(state.clone()));
     let app = Router::new()
         .merge(routes::router())
         .layer(DefaultBodyLimit::max(64 * 1024 * 1024))
@@ -111,9 +125,11 @@ async fn main() -> Result<()> {
     let address = SocketAddr::from(([0, 0, 0, 0], port));
     let listener = tokio::net::TcpListener::bind(address).await?;
     info!(%address, "API listening");
-    axum::serve(listener, app)
+    let serve_result = axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
-        .await?;
+        .await;
+    discovery_scheduler.abort();
+    serve_result?;
     Ok(())
 }
 

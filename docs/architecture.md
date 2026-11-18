@@ -56,6 +56,17 @@ upserted snapshot per minute whenever relevant records change. These snapshots
 preserve backlog history without storing source text and let the dashboard show
 both cumulative research output and the changing amount of work awaiting human
 review. The mechanism is database-local and does not require a telemetry SaaS.
+The same current counts are exported in Prometheus text format at `/metrics`;
+no source text, labels or high-cardinality work identifiers are emitted.
+
+## Scheduled acquisition
+
+Saved Crossref searches live in PostgreSQL with bounded result counts and a
+minimum hourly cadence. The Rust process atomically claims due schedules with
+row locking, advances their next-run timestamp before the network request and
+records both successful coverage and failures in the audit trail. Only selected
+bibliographic fields are retained. The Python worker remains network-agnostic
+and performs only local processing.
 
 ## Scaling boundary
 

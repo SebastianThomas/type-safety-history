@@ -44,6 +44,11 @@ the current principal. Audit identity is always taken from that authenticated
 principal. Legacy `actor`, `labelled_by`, and `requested_by` request fields are
 accepted for compatibility but ignored.
 
+Viewer accounts can inspect protected research and review queues but cannot
+change them. Curators can review and annotate scholarship; administrators can
+also manage accounts and token metadata. The searchable audit trail is exposed
+at `GET /api/v1/audit`.
+
 For host-side checks:
 
 ```bash
@@ -131,6 +136,16 @@ queue. Importing a candidate's DOI through `/api/v1/imports/crossref` links it t
 the canonical work; irrelevant candidates can be rejected with an audited
 reason.
 
+Recurring, licence-compliant Crossref searches can be created through
+`POST /api/v1/discovery/schedules`. The Rust service claims due schedules,
+records every coverage run, and queues local entity resolution. Schedules have
+a minimum hourly cadence and can be disabled or run manually from `/curate`.
+
+When `OPENALEX_API_KEY` is configured, curators can also search selected
+OpenAlex bibliographic metadata through `POST /api/v1/discovery/openalex`.
+OpenAlex metadata is retained under CC0; abstracts, full-text URLs and document
+content are deliberately excluded by the adapter.
+
 ## Local PDF ingestion
 
 PDF acquisition is curator-driven. The upload must include its source URL,
@@ -185,6 +200,13 @@ Evolution includes cumulative discovery/research events and durable
 minute-bucketed snapshots of pending discovery, proof-review and worker queues.
 The overview remains authoritative for the current instant.
 
+`/curate` is the authenticated browser workspace for proof, discovery,
+duplicate, entity and citation review, work inspection, saved searches, audit
+history and account administration. It stores the bearer token only in the
+browser tab's session storage and loads no third-party JavaScript. API
+documentation is available at `/docs` and `/api/openapi.json`; Prometheus text
+metrics are available at `/metrics`.
+
 ## Lifecycle operations
 
 `POST /api/v1/documents/{id}/takedown` performs an authenticated, audited and
@@ -208,6 +230,12 @@ and review reason are mandatory.
 checksummed Zstandard-compressed file under `/data/parquet/approved-proofs/`.
 Exports contain bibliographic metadata, proof classifications, paraphrases and
 evidence coordinates, but no extracted PDF text.
+
+`GET /api/v1/ml/pipeline-runs` exposes the exact local pipeline and library
+versions used for reproducibility. Curators can queue all active, ML-permitted
+documents for a fresh deterministic pass with
+`POST /api/v1/ml/jobs/reprocess-documents`; existing reviewed assertions are
+not silently replaced.
 
 ## Policies
 

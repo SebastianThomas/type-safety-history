@@ -9,7 +9,11 @@ use serde_json::{Value, json};
 use sqlx::FromRow;
 use uuid::Uuid;
 
-use crate::{AppState, auth::require_curator, routes::ApiError};
+use crate::{
+    AppState,
+    auth::{require_curator, require_viewer},
+    routes::ApiError,
+};
 
 pub(crate) fn router() -> Router<AppState> {
     Router::new()
@@ -570,7 +574,7 @@ async fn get_work_research(
     headers: HeaderMap,
     Path(id): Path<Uuid>,
 ) -> Result<Json<Value>, ApiError> {
-    require_curator(&state, &headers).await?;
+    require_viewer(&state, &headers).await?;
     let work: Option<Value> = sqlx::query_scalar(
         "SELECT jsonb_build_object('id', id, 'title', title, 'doi', doi, \
          'publication_year', publication_year, 'review_status', review_status, \
@@ -674,7 +678,7 @@ async fn list_duplicate_suggestions(
     headers: HeaderMap,
     Query(page): Query<Page>,
 ) -> Result<Json<Vec<DuplicateSuggestion>>, ApiError> {
-    require_curator(&state, &headers).await?;
+    require_viewer(&state, &headers).await?;
     let rows = sqlx::query_as::<_, DuplicateSuggestion>(
         "SELECT id, left_work_id, right_work_id, score, method, rationale, \
          status::text AS status FROM duplicate_suggestions WHERE status = 'pending' \
