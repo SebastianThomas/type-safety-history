@@ -266,3 +266,11 @@ jobs:
             args+=(--prerelease)
           fi
           gh release create "${args[@]}"
+
+  deployment:
+    if: needs.release-context.outputs.release == 'true'
+    needs: [release-context, github-release]
+    uses: ./.github/workflows/deploy.yml
+    with:
+      tag: ${{ needs.release-context.outputs.tag }}
+    secrets: inherit
