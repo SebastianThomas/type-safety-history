@@ -5,8 +5,14 @@ description = "Local-only document extraction and ML worker"
 requires-python = ">=3.13"
 dependencies = [
   "psycopg[binary]>=3.2,<4",
-  "pymupdf>=1.25,<2",
+  "pypdf>=6,<8",
+  "pypdfium2>=5,<6",
   "pyarrow>=19,<24",
+  "numpy>=2,<3",
+  "pillow>=11,<13",
+  "pytesseract>=0.3.13,<1",
+  "scikit-learn>=1.6,<2",
+  "zarr>=3,<4",
 ]
 
 [dependency-groups]

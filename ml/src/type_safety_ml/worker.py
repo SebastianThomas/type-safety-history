@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 import logging
 import os
+import re
+import shutil
 import socket
 import time
 from dataclasses import dataclass
@@ -11,16 +14,28 @@ from pathlib import Path
 from typing import Any
 from uuid import UUID
 
+import numpy as np
 import psycopg
 import pyarrow as pa
 import pyarrow.parquet as pq
-import pymupdf
+import pypdfium2 as pdfium
+import pytesseract
+import sklearn
+import zarr
+from PIL import Image
 from psycopg.rows import dict_row
+from pypdf import PdfReader
+from sklearn.feature_extraction.text import HashingVectorizer, TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
+from sklearn.preprocessing import normalize
 
 LOG = logging.getLogger("type_safety_ml.worker")
 LEASE_SECONDS = 300
 PIPELINE_VERSION = "local-term-baseline-v1"
+EMBEDDING_ALGORITHM = "sklearn-hashing-word-1-2-v1"
+EMBEDDING_DIMENSIONS = 512
 MAX_CANDIDATES_PER_DOCUMENT = 25
+DOI_PATTERN = re.compile(r"\b10\.\d{4,9}/[-._;()/:A-Z0-9]+", re.IGNORECASE)
 
 
 @dataclass(frozen=True)
@@ -32,12 +47,25 @@ class Candidate:
     content_sha256: str
     matched_terms: tuple[str, ...]
     candidate_key: str
+    confidence: float
+
+
+@dataclass(frozen=True)
+class CitationCandidate:
+    page: int
+    doi: str
+    context_sha256: str
 
 
 @dataclass(frozen=True)
 class ProcessedDocument:
     result: dict[str, Any]
     candidates: tuple[Candidate, ...]
+    citations: tuple[CitationCandidate, ...]
+    embedding: tuple[float, ...]
+    zarr_object_key: str
+    zarr_manifest_sha256: str
+    ocr_page_count: int
 
 
 def safe_object_path(data_root: Path, object_key: str) -> Path:
@@ -52,12 +80,34 @@ def safe_object_path(data_root: Path, object_key: str) -> Path:
 
 def extract_pdf(path: Path, derived_root: Path, document_id: UUID) -> ProcessedDocument:
     pages: list[dict[str, Any]] = []
-    with pymupdf.open(path) as document:
-        if document.needs_pass:
-            raise ValueError("encrypted PDFs are not processed")
-        for number, page in enumerate(document, start=1):
-            text = page.get_text("text")
-            pages.append({"page": number, "text": text})
+    ocr_page_count = 0
+    reader = PdfReader(path)
+    if reader.is_encrypted:
+        raise ValueError("encrypted PDFs are not processed")
+    render_document: pdfium.PdfDocument | None = None
+    try:
+        for number, page in enumerate(reader.pages, start=1):
+            text = page.extract_text() or ""
+            extraction_method = "embedded_text"
+            if len(text.strip()) < 40 and shutil.which("tesseract"):
+                render_document = render_document or pdfium.PdfDocument(path)
+                render_page = render_document[number - 1]
+                bitmap = render_page.render(scale=200 / 72)
+                rendered = bitmap.to_pil()
+                buffer = io.BytesIO()
+                rendered.save(buffer, format="PNG")
+                image = Image.open(io.BytesIO(buffer.getvalue()))
+                ocr_text = pytesseract.image_to_string(image, lang="eng")
+                bitmap.close()
+                render_page.close()
+                if len(ocr_text.strip()) > len(text.strip()):
+                    text = ocr_text
+                    extraction_method = "tesseract_ocr"
+                    ocr_page_count += 1
+            pages.append({"page": number, "text": text, "method": extraction_method})
+    finally:
+        if render_document is not None:
+            render_document.close()
 
     encoded = json.dumps(
         {"document_id": str(document_id), "pages": pages},
@@ -72,6 +122,10 @@ def extract_pdf(path: Path, derived_root: Path, document_id: UUID) -> ProcessedD
     temporary.write_bytes(encoded)
     temporary.replace(destination)
     candidates = classify_pages(document_id, pages)
+    citations = extract_citation_candidates(pages)
+    zarr_object_key, zarr_manifest_sha256, embedding = write_embeddings(
+        derived_root.parent, document_id, pages
+    )
     return ProcessedDocument(
         result={
             "derived_object_key": str(destination.relative_to(derived_root.parent)),
@@ -79,31 +133,109 @@ def extract_pdf(path: Path, derived_root: Path, document_id: UUID) -> ProcessedD
             "page_count": len(pages),
             "candidate_count": len(candidates),
             "pipeline_version": PIPELINE_VERSION,
+            "embedding_algorithm": EMBEDDING_ALGORITHM,
+            "ocr_page_count": ocr_page_count,
         },
         candidates=tuple(candidates),
+        citations=tuple(citations),
+        embedding=tuple(float(value) for value in embedding),
+        zarr_object_key=zarr_object_key,
+        zarr_manifest_sha256=zarr_manifest_sha256,
+        ocr_page_count=ocr_page_count,
     )
+
+
+def write_embeddings(
+    data_root: Path, document_id: UUID, pages: list[dict[str, Any]]
+) -> tuple[str, str, np.ndarray[Any, np.dtype[np.float32]]]:
+    texts = [str(page["text"]) for page in pages] or [""]
+    vectorizer = HashingVectorizer(
+        n_features=EMBEDDING_DIMENSIONS,
+        alternate_sign=False,
+        norm="l2",
+        ngram_range=(1, 2),
+        stop_words="english",
+    )
+    page_vectors = vectorizer.transform(texts).toarray().astype(np.float32)
+    document_vector = page_vectors.mean(axis=0, dtype=np.float32).reshape(1, -1)
+    document_vector = normalize(document_vector, norm="l2").astype(np.float32)[0]
+    relative = Path("zarr") / "document-embeddings" / f"{document_id}.zarr"
+    destination = data_root / relative
+    temporary = destination.with_name(destination.name + ".tmp")
+    if temporary.exists():
+        shutil.rmtree(temporary)
+    if destination.exists():
+        shutil.rmtree(destination)
+    temporary.parent.mkdir(parents=True, exist_ok=True)
+    group = zarr.open_group(temporary, mode="w")
+    group.create_array(
+        "page_embeddings",
+        data=page_vectors,
+        chunks=(max(1, min(64, len(page_vectors))), EMBEDDING_DIMENSIONS),
+    )
+    group.create_array("document_embedding", data=document_vector)
+    group.attrs.update(
+        {
+            "algorithm": EMBEDDING_ALGORITHM,
+            "dimensions": EMBEDDING_DIMENSIONS,
+            "document_id": str(document_id),
+            "page_count": len(pages),
+            "library": f"scikit-learn {sklearn.__version__}",
+            "license": "BSD-3-Clause",
+        }
+    )
+    temporary.replace(destination)
+    manifest = hashlib.sha256()
+    for file in sorted(path for path in destination.rglob("*") if path.is_file()):
+        manifest.update(str(file.relative_to(destination)).encode("utf-8"))
+        manifest.update(hashlib.sha256(file.read_bytes()).digest())
+    return str(relative), manifest.hexdigest(), document_vector
+
+
+def extract_citation_candidates(pages: list[dict[str, Any]]) -> list[CitationCandidate]:
+    candidates: list[CitationCandidate] = []
+    seen: set[tuple[int, str]] = set()
+    for page in pages:
+        text = str(page["text"])
+        for match in DOI_PATTERN.finditer(text):
+            doi = match.group(0).rstrip(".,;:)]}").lower()
+            key = (int(page["page"]), doi)
+            if key in seen:
+                continue
+            context = text[max(0, match.start() - 160) : min(len(text), match.end() + 160)]
+            candidates.append(
+                CitationCandidate(
+                    page=key[0],
+                    doi=doi,
+                    context_sha256=hashlib.sha256(context.encode("utf-8")).hexdigest(),
+                )
+            )
+            seen.add(key)
+    return candidates
 
 
 def classify_pages(document_id: UUID, pages: list[dict[str, Any]]) -> list[Candidate]:
     candidates: list[Candidate] = []
     patterns = (
-        ("progress_and_preservation", ("progress", "preservation")),
-        ("preservation", ("subject reduction",)),
-        ("type_soundness", ("type soundness",)),
-        ("type_soundness", ("well-typed", "go wrong")),
-        ("preservation", ("preservation",)),
-        ("progress", ("progress",)),
+        ("progress_and_preservation", ("progress", "preservation"), 0.92),
+        ("preservation", ("subject reduction",), 0.88),
+        ("type_soundness", ("type soundness",), 0.86),
+        ("type_soundness", ("well-typed", "go wrong"), 0.84),
+        ("preservation", ("preservation",), 0.72),
+        ("progress", ("progress",), 0.70),
     )
     for page in pages:
         text = str(page["text"])
         lowered = text.casefold()
         emitted: set[str] = set()
-        for result_kind, terms in patterns:
+        for result_kind, terms, confidence in patterns:
             if result_kind in emitted or not all(term in lowered for term in terms):
                 continue
             offsets = [lowered.index(term) for term in terms]
             char_start = min(offsets)
-            char_end = min(len(text), max(offsets[index] + len(term) for index, term in enumerate(terms)))
+            char_end = min(
+                len(text), max(offsets[index] + len(term) for index, term in enumerate(terms))
+            )
             content_sha256 = hashlib.sha256(text.encode("utf-8")).hexdigest()
             key_material = (
                 f"{document_id}:{page['page']}:{result_kind}:{content_sha256}:{PIPELINE_VERSION}"
@@ -117,6 +249,7 @@ def classify_pages(document_id: UUID, pages: list[dict[str, Any]]) -> list[Candi
                     content_sha256=content_sha256,
                     matched_terms=terms,
                     candidate_key=hashlib.sha256(key_material.encode("utf-8")).hexdigest(),
+                    confidence=confidence,
                 )
             )
             emitted.add(result_kind)
@@ -180,11 +313,24 @@ def persist_success(
         cursor.execute(
             """
             INSERT INTO pipeline_runs
-                (pipeline_name, pipeline_version, configuration)
-            VALUES ('local-proof-candidate-extraction', %s, %s)
+                (pipeline_name, pipeline_version, model_name, model_version,
+                 model_license, configuration)
+            VALUES ('local-proof-candidate-extraction', %s, 'scikit-learn', %s,
+                    'BSD-3-Clause', %s)
             RETURNING id
             """,
-            (PIPELINE_VERSION, json.dumps({"kind": "deterministic_term_baseline"})),
+            (
+                PIPELINE_VERSION,
+                sklearn.__version__,
+                json.dumps(
+                    {
+                        "kind": "deterministic_term_baseline",
+                        "embedding_algorithm": EMBEDDING_ALGORITHM,
+                        "embedding_dimensions": EMBEDDING_DIMENSIONS,
+                        "hosted_model": False,
+                    }
+                ),
+            ),
         )
         pipeline_run_id = cursor.fetchone()["id"]
         for candidate in processed.candidates:
@@ -196,8 +342,8 @@ def persist_success(
                 """
                 INSERT INTO proof_results
                     (work_id, result_kind, statement_summary, source_document_id,
-                     pipeline_run_id, candidate_key)
-                VALUES (%s, %s, %s, %s, %s, %s)
+                     pipeline_run_id, candidate_key, confidence, classifier_version)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
                 ON CONFLICT (candidate_key) DO NOTHING
                 RETURNING id
                 """,
@@ -208,6 +354,8 @@ def persist_success(
                     document_id,
                     pipeline_run_id,
                     candidate.candidate_key,
+                    candidate.confidence,
+                    PIPELINE_VERSION,
                 ),
             )
             inserted = cursor.fetchone()
@@ -260,6 +408,79 @@ def persist_success(
                     """,
                     (proof_result_id, obligation),
                 )
+        cursor.execute(
+            """
+            INSERT INTO document_embeddings
+                (document_id, algorithm, dimensions, vector, zarr_object_key,
+                 zarr_manifest_sha256, pipeline_run_id)
+            VALUES (%s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (document_id) DO UPDATE SET
+                algorithm = EXCLUDED.algorithm, dimensions = EXCLUDED.dimensions,
+                vector = EXCLUDED.vector, zarr_object_key = EXCLUDED.zarr_object_key,
+                zarr_manifest_sha256 = EXCLUDED.zarr_manifest_sha256,
+                pipeline_run_id = EXCLUDED.pipeline_run_id, created_at = now()
+            """,
+            (
+                document_id,
+                EMBEDDING_ALGORITHM,
+                EMBEDDING_DIMENSIONS,
+                list(processed.embedding),
+                processed.zarr_object_key,
+                processed.zarr_manifest_sha256,
+                pipeline_run_id,
+            ),
+        )
+        cursor.execute(
+            """
+            SELECT document_id, vector FROM document_embeddings
+            WHERE document_id <> %s AND algorithm = %s AND dimensions = %s
+            """,
+            (document_id, EMBEDDING_ALGORITHM, EMBEDDING_DIMENSIONS),
+        )
+        current = np.asarray(processed.embedding, dtype=np.float32)
+        for other in cursor.fetchall():
+            other_id = other["document_id"]
+            score = float(np.clip(np.dot(current, np.asarray(other["vector"])), 0.0, 1.0))
+            left_id, right_id = sorted((document_id, other_id))
+            cursor.execute(
+                """
+                INSERT INTO document_similarities
+                    (left_document_id, right_document_id, score, algorithm)
+                VALUES (%s, %s, %s, %s)
+                ON CONFLICT (left_document_id, right_document_id, algorithm)
+                DO UPDATE SET score = EXCLUDED.score, created_at = now()
+                """,
+                (left_id, right_id, score, EMBEDDING_ALGORITHM),
+            )
+        for citation in processed.citations:
+            cursor.execute(
+                """
+                INSERT INTO citation_candidates
+                    (citing_work_id, source_document_id, page, cited_doi,
+                     context_sha256, created_by)
+                VALUES (%s, %s, %s, %s, %s, %s)
+                ON CONFLICT (source_document_id, page, cited_doi) DO NOTHING
+                """,
+                (
+                    document["work_id"],
+                    document_id,
+                    citation.page,
+                    citation.doi,
+                    citation.context_sha256,
+                    PIPELINE_VERSION,
+                ),
+            )
+        cursor.execute(
+            """
+            UPDATE documents SET extraction_method = %s, ocr_page_count = %s,
+                processed_at = now() WHERE id = %s
+            """,
+            (
+                "embedded_text_with_ocr_fallback" if processed.ocr_page_count else "embedded_text",
+                processed.ocr_page_count,
+                document_id,
+            ),
+        )
         cursor.execute(
             "UPDATE pipeline_runs SET finished_at = now() WHERE id = %s",
             (pipeline_run_id,),
@@ -403,11 +624,176 @@ def persist_export_success(
             WHERE id = %s
             """,
             (
-                json.dumps(
-                    {"object_key": object_key, "sha256": sha256, "row_count": row_count}
-                ),
+                json.dumps({"object_key": object_key, "sha256": sha256, "row_count": row_count}),
                 job_id,
             ),
+        )
+
+
+def resolve_discovery_entities(connection: psycopg.Connection[Any]) -> dict[str, int]:
+    with connection.transaction(), connection.cursor(row_factory=dict_row) as cursor:
+        cursor.execute(
+            "SELECT id, title, publication_year FROM discovery_candidates WHERE status = 'pending'"
+        )
+        candidates = cursor.fetchall()
+        cursor.execute("SELECT id, title, publication_year FROM works")
+        works = cursor.fetchall()
+        if not candidates or not works:
+            return {"candidates": len(candidates), "suggestions": 0}
+        texts = [row["title"] for row in candidates] + [row["title"] for row in works]
+        matrix = TfidfVectorizer(analyzer="char_wb", ngram_range=(3, 5)).fit_transform(texts)
+        scores = cosine_similarity(matrix[: len(candidates)], matrix[len(candidates) :])
+        stored = 0
+        for candidate_index, candidate in enumerate(candidates):
+            for work_index in np.argsort(scores[candidate_index])[-3:][::-1]:
+                score = float(scores[candidate_index, work_index])
+                work = works[int(work_index)]
+                year_match = (
+                    candidate["publication_year"] is not None
+                    and candidate["publication_year"] == work["publication_year"]
+                )
+                adjusted = min(1.0, score + (0.05 if year_match else 0.0))
+                if adjusted < 0.55:
+                    continue
+                cursor.execute(
+                    """
+                    INSERT INTO entity_resolution_suggestions
+                        (discovery_candidate_id, work_id, score, method, rationale)
+                    VALUES (%s, %s, %s, %s, %s)
+                    ON CONFLICT (discovery_candidate_id, work_id, method)
+                    DO UPDATE SET score = EXCLUDED.score, rationale = EXCLUDED.rationale
+                    """,
+                    (
+                        candidate["id"],
+                        work["id"],
+                        adjusted,
+                        "sklearn-char-tfidf-3-5-v1",
+                        json.dumps({"title_score": score, "publication_year_match": year_match}),
+                    ),
+                )
+                stored += 1
+        return {"candidates": len(candidates), "suggestions": stored}
+
+
+def resolve_work_duplicates(connection: psycopg.Connection[Any]) -> dict[str, int]:
+    with connection.transaction(), connection.cursor(row_factory=dict_row) as cursor:
+        cursor.execute("SELECT id, title, publication_year FROM works ORDER BY id")
+        works = cursor.fetchall()
+        if len(works) < 2:
+            return {"works": len(works), "suggestions": 0}
+        matrix = TfidfVectorizer(analyzer="char_wb", ngram_range=(3, 5)).fit_transform(
+            [row["title"] for row in works]
+        )
+        scores = cosine_similarity(matrix)
+        stored = 0
+        for left_index, left in enumerate(works):
+            for right_index in range(left_index + 1, len(works)):
+                right = works[right_index]
+                score = float(scores[left_index, right_index])
+                year_match = (
+                    left["publication_year"] is not None
+                    and left["publication_year"] == right["publication_year"]
+                )
+                adjusted = min(1.0, score + (0.05 if year_match else 0.0))
+                if adjusted < 0.75:
+                    continue
+                left_id, right_id = sorted((left["id"], right["id"]))
+                cursor.execute(
+                    """
+                    INSERT INTO duplicate_suggestions
+                        (left_work_id, right_work_id, score, method, rationale)
+                    VALUES (%s, %s, %s, %s, %s)
+                    ON CONFLICT (left_work_id, right_work_id, method)
+                    DO UPDATE SET score = EXCLUDED.score, rationale = EXCLUDED.rationale
+                    """,
+                    (
+                        left_id,
+                        right_id,
+                        adjusted,
+                        "sklearn-char-tfidf-3-5-v1",
+                        json.dumps({"title_score": score, "publication_year_match": year_match}),
+                    ),
+                )
+                stored += 1
+        return {"works": len(works), "suggestions": stored}
+
+
+def evaluate_classifier(connection: psycopg.Connection[Any]) -> dict[str, Any]:
+    with connection.transaction(), connection.cursor(row_factory=dict_row) as cursor:
+        cursor.execute(
+            """
+            SELECT ml.is_relevant, ml.expected_result_kind, pr.result_kind
+            FROM ml_labels ml JOIN proof_results pr ON pr.id = ml.proof_result_id
+            WHERE pr.classifier_version = %s
+            """,
+            (PIPELINE_VERSION,),
+        )
+        labels = cursor.fetchall()
+        true_positives = sum(
+            row["is_relevant"] and row["expected_result_kind"] == row["result_kind"]
+            for row in labels
+        )
+        false_positives = sum(
+            not row["is_relevant"] or row["expected_result_kind"] != row["result_kind"]
+            for row in labels
+        )
+        false_negatives = sum(
+            row["is_relevant"] and row["expected_result_kind"] != row["result_kind"]
+            for row in labels
+        )
+        precision = (
+            true_positives / (true_positives + false_positives)
+            if true_positives + false_positives
+            else None
+        )
+        recall = (
+            true_positives / (true_positives + false_negatives)
+            if true_positives + false_negatives
+            else None
+        )
+        f1 = (
+            2 * precision * recall / (precision + recall)
+            if precision is not None and recall is not None and precision + recall
+            else None
+        )
+        cursor.execute(
+            """
+            INSERT INTO ml_evaluations
+                (pipeline_version, labelled_examples, true_positives, false_positives,
+                 false_negatives, precision, recall, f1, details)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id
+            """,
+            (
+                PIPELINE_VERSION,
+                len(labels),
+                true_positives,
+                false_positives,
+                false_negatives,
+                precision,
+                recall,
+                f1,
+                json.dumps({"metric_scope": "machine candidates with curator labels"}),
+            ),
+        )
+        return {
+            "evaluation_id": str(cursor.fetchone()["id"]),
+            "labelled_examples": len(labels),
+            "precision": precision,
+            "recall": recall,
+            "f1": f1,
+        }
+
+
+def persist_generic_job_success(
+    connection: psycopg.Connection[Any], job_id: UUID, result: dict[str, Any]
+) -> None:
+    with connection.transaction():
+        connection.execute(
+            """
+            UPDATE jobs SET status = 'succeeded', result = %s,
+                leased_until = NULL, updated_at = now() WHERE id = %s
+            """,
+            (json.dumps(result), job_id),
         )
 
 
@@ -444,6 +830,18 @@ def run() -> None:
                                 sha256,
                                 row_count,
                             )
+                        elif job["job_type"] == "resolve_discovery_entities":
+                            persist_generic_job_success(
+                                connection, job["id"], resolve_discovery_entities(connection)
+                            )
+                        elif job["job_type"] == "resolve_work_duplicates":
+                            persist_generic_job_success(
+                                connection, job["id"], resolve_work_duplicates(connection)
+                            )
+                        elif job["job_type"] == "evaluate_local_classifier":
+                            persist_generic_job_success(
+                                connection, job["id"], evaluate_classifier(connection)
+                            )
                         else:
                             raise ValueError(f"unsupported job type: {job['job_type']}")
                     except Exception as error:  # job boundary: failure is persisted
@@ -467,4 +865,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

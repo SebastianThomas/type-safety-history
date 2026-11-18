@@ -65,15 +65,26 @@ audited reason.
 ## Local ML
 
 No document content or embedding is sent to a hosted inference or OCR service.
-Model weights are acquired in a controlled preparation step and recorded with
-source, version, checksum and licence. Runtime pods do not need outbound network
-access. Documents whose terms do not permit local ML are excluded from jobs.
+The baseline has no downloaded model weights: it uses deterministic
+scikit-learn hashing/TF-IDF algorithms (BSD-3-Clause) and the locally installed
+Tesseract OCR engine (Apache-2.0). PDF text and rendering use pypdf
+(BSD-3-Clause) and pypdfium2 (Apache-2.0 OR BSD-3-Clause, including the licence
+notices shipped with its PDFium wheel). Library versions, algorithms and
+licences are recorded with pipeline output. Runtime ML does not need outbound network access.
+Documents whose terms do not permit local ML are excluded from jobs.
 
 The initial `local-term-baseline-v1` pipeline is deliberately deterministic and
 conservative. It detects terminology associated with progress, preservation,
 subject reduction and type soundness, records only page/character coordinates
 and a paraphrase in PostgreSQL, and leaves every result in `machine_candidate`.
 It is a discovery aid, not evidence that a theorem actually appears or is valid.
+
+Embedded PDF text is preferred. Tesseract is used only as a local fallback for
+pages with little embedded text, and OCR usage is recorded per document. DOI
+mentions become hashed-context citation candidates; no citation is promoted
+without curator review. Similarity, duplicate and entity-resolution scores are
+also suggestions, never canonical assertions. Curator labels can be used to
+calculate local precision, recall and F1 for a recorded pipeline version.
 
 ## Curator-supplied documents
 

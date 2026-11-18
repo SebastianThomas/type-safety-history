@@ -43,6 +43,8 @@ pub(crate) fn router() -> Router<AppState> {
         .route("/api/v1/timeline", get(timeline))
         .route("/api/v1/exports", post(create_export))
         .route("/api/v1/exports/{id}", get(get_export))
+        .merge(crate::ml::router())
+        .merge(crate::research::router())
 }
 
 async fn live() -> Json<Value> {
@@ -188,6 +190,14 @@ async fn create_work(
     .bind(input.redistribution_permitted)
     .execute(&mut *tx)
     .await?;
+    sqlx::query(
+        "INSERT INTO jobs (job_type, idempotency_key, payload) \
+         VALUES ('resolve_work_duplicates', $1, $2)",
+    )
+    .bind(format!("resolve-work-duplicates:work:{}", work.id))
+    .bind(json!({"work_id": work.id}))
+    .execute(&mut *tx)
+    .await?;
     tx.commit().await?;
     Ok((StatusCode::CREATED, Json(work)))
 }
@@ -274,6 +284,24 @@ async fn discover_crossref(
         candidate_ids.push(candidate_id);
     }
     sqlx::query(
+        "INSERT INTO coverage_runs \
+         (provider, query_text, from_year, until_year, requested_rows, result_count, \
+          started_at, finished_at, configuration) \
+         VALUES ('crossref', $1, $2, $3, $4, $5, now(), now(), $6)",
+    )
+    .bind(query)
+    .bind(input.from_year)
+    .bind(input.until_year)
+    .bind(input.rows as i32)
+    .bind(candidate_ids.len() as i32)
+    .bind(json!({
+        "endpoint": "/v1/works",
+        "query_parameter": "query.bibliographic",
+        "selected_fields_only": true
+    }))
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query(
         "INSERT INTO audit_log (actor, action, entity_type, after_value, reason) \
          VALUES ('crossref-discovery', 'discover', 'discovery_candidate', $1, \
                  'Curator-requested Crossref bibliographic search')",
@@ -286,10 +314,21 @@ async fn discover_crossref(
     }))
     .execute(&mut *tx)
     .await?;
+    let resolution_job_id = Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO jobs (id, job_type, idempotency_key, payload) \
+         VALUES ($1, 'resolve_discovery_entities', $2, $3)",
+    )
+    .bind(resolution_job_id)
+    .bind(format!("resolve-discovery-entities:{resolution_job_id}"))
+    .bind(json!({"candidate_ids": candidate_ids}))
+    .execute(&mut *tx)
+    .await?;
     tx.commit().await?;
     Ok(Json(json!({
         "candidate_ids": candidate_ids,
-        "result_count": candidate_ids.len()
+        "result_count": candidate_ids.len(),
+        "resolution_job_id": resolution_job_id
     })))
 }
 
@@ -1017,6 +1056,8 @@ struct ProofCandidate {
     result_kind: String,
     proof_method: Option<String>,
     statement_summary: String,
+    confidence: Option<f32>,
+    classifier_version: Option<String>,
     created_at: String,
 }
 
@@ -1028,7 +1069,7 @@ async fn list_candidates(
     require_curator(&state, &headers)?;
     let candidates = sqlx::query_as::<_, ProofCandidate>(
         "SELECT id, work_id, theorem_name, result_kind, proof_method, statement_summary, \
-         created_at::text AS created_at \
+         confidence, classifier_version, created_at::text AS created_at \
          FROM proof_results WHERE status = 'machine_candidate' \
          ORDER BY created_at LIMIT $1 OFFSET $2",
     )
@@ -1049,6 +1090,8 @@ struct ProofResultDetail {
     proof_method: Option<String>,
     statement_summary: String,
     status: String,
+    confidence: Option<f32>,
+    classifier_version: Option<String>,
 }
 
 #[derive(Serialize, FromRow)]
@@ -1070,7 +1113,8 @@ async fn get_proof_result(
     require_curator(&state, &headers)?;
     let result = sqlx::query_as::<_, ProofResultDetail>(
         "SELECT id, work_id, source_document_id, theorem_name, result_kind, proof_method, \
-         statement_summary, status::text AS status FROM proof_results WHERE id = $1",
+         statement_summary, status::text AS status, confidence, classifier_version \
+         FROM proof_results WHERE id = $1",
     )
     .bind(id)
     .fetch_optional(&state.db)
@@ -1426,7 +1470,7 @@ async fn review_candidate(
     Ok(StatusCode::NO_CONTENT)
 }
 
-fn require_curator(state: &AppState, headers: &HeaderMap) -> Result<(), ApiError> {
+pub(crate) fn require_curator(state: &AppState, headers: &HeaderMap) -> Result<(), ApiError> {
     let configured = state
         .curator_token
         .as_deref()
@@ -1489,7 +1533,7 @@ fn normalize_doi(doi: &str) -> String {
 }
 
 #[derive(Debug, Error)]
-enum ApiError {
+pub(crate) enum ApiError {
     #[error("not found")]
     NotFound,
     #[error("bad request: {0}")]

@@ -59,6 +59,21 @@ curl -X POST http://localhost:8080/api/v1/imports/crossref \
 
 The initial DOI queue is in [`fixtures/seed-works.json`](fixtures/seed-works.json).
 
+## Research and historical curation
+
+The research model distinguishes bibliographic works from versions, relations,
+formal artifacts, citations and individual proof results. Proof results can be
+classified by language feature and type-system family. Corrections,
+retractions, disputes, counterexamples and priority claims are first-class,
+evidence-linked annotations; scholarly status is therefore not inferred from a
+single machine score.
+
+`GET /api/v1/works/{id}/research` returns the aggregate research record.
+Curator endpoints create versions, work relations, citations, formal artifacts,
+feature/type-system assignments and research annotations. Coverage runs retain
+the exact provider, query, year interval, requested/result counts and adapter
+configuration, so corpus completeness can be measured and reproduced.
+
 ## Corpus discovery
 
 Curators can search Crossref bibliographic metadata without importing results:
@@ -93,7 +108,26 @@ curl -X POST http://localhost:8080/api/v1/documents/upload \
 The service streams the file, enforces a 50 MiB limit, validates PDF magic,
 computes SHA-256, and atomically stores it under `/data/objects/sha256/`.
 The local Python worker extracts permitted documents and creates page-level
-machine candidates for curator review.
+machine candidates for curator review. It also writes deterministic page and
+document embeddings to local Zarr storage, records document similarity, and
+extracts DOI citation candidates. Scanned pages use local Tesseract OCR as a
+fallback; no document content is sent to a hosted model or OCR service.
+
+## Local ML review
+
+All ML output remains a suggestion. Curator-protected endpoints expose the
+queues and their audit-preserving resolution actions:
+
+- `GET /api/v1/citation-candidates`
+- `GET /api/v1/entity-resolution-suggestions`
+- `GET /api/v1/duplicate-suggestions`
+- `GET /api/v1/documents/{id}/similarities`
+- `POST /api/v1/ml/labels` and `POST /api/v1/ml/evaluations`
+
+Creating works automatically queues duplicate detection; Crossref discovery
+automatically queues entity resolution. Manual reruns are available through
+`POST /api/v1/ml/jobs/entity-resolution` and
+`POST /api/v1/ml/jobs/duplicate-detection`.
 
 ## Timeline and exports
 
@@ -112,4 +146,5 @@ evidence coordinates, but no extracted PDF text.
 - [`docs/corpus-policy.md`](docs/corpus-policy.md)
 - [`docs/source-and-rights-policy.md`](docs/source-and-rights-policy.md)
 - [`docs/architecture.md`](docs/architecture.md)
+- [`docs/ml-dependencies.md`](docs/ml-dependencies.md)
 

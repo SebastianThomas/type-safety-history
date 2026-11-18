@@ -1,5 +1,7 @@
 FROM ghcr.io/astral-sh/uv:python3.13-bookworm-slim
-RUN useradd --system --uid 10002 --create-home worker
+RUN apt-get update && apt-get install -y --no-install-recommends tesseract-ocr tesseract-ocr-eng \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd --system --uid 10002 --create-home worker
 WORKDIR /app
 COPY ml/pyproject.toml ml/uv.lock ./
 RUN uv sync --frozen --no-dev --no-install-project
