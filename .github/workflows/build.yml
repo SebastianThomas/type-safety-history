@@ -7,6 +7,44 @@ permissions:
   contents: read
 
 jobs:
+  release-context:
+    runs-on: ubuntu-latest
+    outputs:
+      release: ${{ steps.release.outputs.release }}
+      tag: ${{ steps.release.outputs.tag }}
+      prerelease: ${{ steps.release.outputs.prerelease }}
+    steps:
+      - id: release
+        name: Validate release context
+        env:
+          REF: ${{ github.ref }}
+          REF_NAME: ${{ github.ref_name }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          if [[ "$REF" == refs/tags/v* ]]; then
+            if [[ ! "$REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+              echo "Release tags must use vMAJOR.MINOR.PATCH with an optional prerelease suffix." >&2
+              exit 1
+            fi
+            release=true
+            tag=$REF_NAME
+            if [[ "$REF_NAME" == *-* ]]; then
+              prerelease=true
+            else
+              prerelease=false
+            fi
+          else
+            release=false
+            tag="ci-${SHA:0:12}"
+            prerelease=false
+          fi
+          {
+            echo "release=$release"
+            echo "tag=$tag"
+            echo "prerelease=$prerelease"
+          } >> "$GITHUB_OUTPUT"
+
   rust:
     runs-on: ubuntu-latest
     services:
@@ -118,13 +156,6 @@ jobs:
       - run: kubectl kustomize db >/dev/null
       - run: kubectl kustomize deploy >/dev/null
 
-  containers:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-      - run: docker build -f containers/api.Dockerfile -t type-safety-history-api:test .
-      - run: docker build -f containers/ml.Dockerfile -t type-safety-history-ml:test .
-
   supply-chain:
     runs-on: ubuntu-latest
     permissions:
@@ -150,33 +181,8 @@ jobs:
           output-file: type-safety-history.spdx.json
           upload-artifact: true
 
-  release-metadata:
-    if: startsWith(github.ref, 'refs/tags/v')
-    needs: [rust, python, end-to-end, manifests, containers, supply-chain]
-    runs-on: ubuntu-latest
-    outputs:
-      tag: ${{ steps.release.outputs.tag }}
-      prerelease: ${{ steps.release.outputs.prerelease }}
-    steps:
-      - id: release
-        name: Validate release tag
-        env:
-          TAG: ${{ github.ref_name }}
-        run: |
-          set -euo pipefail
-          if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
-            echo "Release tags must use vMAJOR.MINOR.PATCH with an optional prerelease suffix." >&2
-            exit 1
-          fi
-          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
-          if [[ "$TAG" == *-* ]]; then
-            echo "prerelease=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "prerelease=false" >> "$GITHUB_OUTPUT"
-          fi
-
-  publish:
-    needs: release-metadata
+  containers:
+    needs: [release-context, rust, python, end-to-end, manifests, supply-chain]
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -193,33 +199,52 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - name: Sign in to Docker Hub
+        if: needs.release-context.outputs.release == 'true'
         uses: docker/login-action@v4
         with:
           username: ${{ vars.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
       - uses: docker/setup-buildx-action@v4
-      - name: Build and publish ${{ matrix.component }} image
+      - id: image
+        name: Select image tags
+        env:
+          COMPONENT: ${{ matrix.component }}
+          RELEASE: ${{ needs.release-context.outputs.release }}
+          RELEASE_TAG: ${{ needs.release-context.outputs.tag }}
+          REPOSITORY: ${{ vars.DOCKERHUB_REPOSITORY }}
+        run: |
+          set -euo pipefail
+          if [ "$RELEASE" = true ]; then
+            {
+              echo 'tags<<EOF'
+              echo "$REPOSITORY:$RELEASE_TAG-$COMPONENT"
+              echo "$REPOSITORY:latest-$COMPONENT"
+              echo 'EOF'
+            } >> "$GITHUB_OUTPUT"
+          else
+            echo "tags=type-safety-history-$COMPONENT:$RELEASE_TAG" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Build ${{ matrix.component }} image${{ needs.release-context.outputs.release == 'true' && ' and publish' || '' }}
         uses: docker/build-push-action@v7
         with:
           context: .
           file: ${{ matrix.dockerfile }}
           platforms: linux/amd64
-          push: true
-          tags: |
-            ${{ vars.DOCKERHUB_REPOSITORY }}:${{ needs.release-metadata.outputs.tag }}-${{ matrix.component }}
-            ${{ vars.DOCKERHUB_REPOSITORY }}:latest-${{ matrix.component }}
+          push: ${{ needs.release-context.outputs.release == 'true' }}
+          tags: ${{ steps.image.outputs.tags }}
           labels: |
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
             org.opencontainers.image.revision=${{ github.sha }}
-            org.opencontainers.image.version=${{ needs.release-metadata.outputs.tag }}
+            org.opencontainers.image.version=${{ needs.release-context.outputs.tag }}
             org.opencontainers.image.title=type-safety-history-${{ matrix.component }}
           cache-from: type=gha,scope=${{ matrix.component }}
           cache-to: type=gha,mode=max,scope=${{ matrix.component }}
-          provenance: mode=max
-          sbom: true
+          provenance: ${{ needs.release-context.outputs.release == 'true' && 'mode=max' || 'false' }}
+          sbom: ${{ needs.release-context.outputs.release == 'true' }}
 
   github-release:
-    needs: [release-metadata, publish]
+    if: needs.release-context.outputs.release == 'true'
+    needs: [release-context, containers]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -228,8 +253,8 @@ jobs:
       - name: Create GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: ${{ needs.release-metadata.outputs.tag }}
-          PRERELEASE: ${{ needs.release-metadata.outputs.prerelease }}
+          TAG: ${{ needs.release-context.outputs.tag }}
+          PRERELEASE: ${{ needs.release-context.outputs.prerelease }}
         run: |
           set -euo pipefail
           if gh release view "$TAG" >/dev/null 2>&1; then
