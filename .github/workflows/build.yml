@@ -91,9 +91,11 @@ jobs:
         run: |
           target/debug/type-safety-history-api > /tmp/type-safety-history-api.log 2>&1 &
           api_pid=$!
-          uv run --project ml type-safety-ml-worker > /tmp/type-safety-history-worker.log 2>&1 &
-          worker_pid=$!
-          trap 'kill "$api_pid" "$worker_pid" || true' EXIT
+          WORKER_ID=ci-worker-1 uv run --project ml type-safety-ml-worker > /tmp/type-safety-history-worker-1.log 2>&1 &
+          worker_1_pid=$!
+          WORKER_ID=ci-worker-2 uv run --project ml type-safety-ml-worker > /tmp/type-safety-history-worker-2.log 2>&1 &
+          worker_2_pid=$!
+          trap 'kill "$api_pid" "$worker_1_pid" "$worker_2_pid" || true' EXIT
           for attempt in $(seq 1 60); do
             if curl --fail --silent http://localhost:8081/health/ready; then
               python3 scripts/e2e.py
@@ -103,7 +105,8 @@ jobs:
             sleep 1
           done
           cat /tmp/type-safety-history-api.log
-          cat /tmp/type-safety-history-worker.log
+          cat /tmp/type-safety-history-worker-1.log
+          cat /tmp/type-safety-history-worker-2.log
           exit 1
 
   manifests:
