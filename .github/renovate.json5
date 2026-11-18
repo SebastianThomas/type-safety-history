@@ -1,0 +1,69 @@
+{
+  $schema: 'https://docs.renovatebot.com/renovate-schema.json',
+  extends: [
+    'config:recommended',
+    ':dependencyDashboard',
+    ':semanticCommitsDisabled',
+  ],
+
+  // Match the homelab repositories: batch dependency noise and auto-merge
+  // only low-risk build automation updates.
+  timezone: 'Europe/Zurich',
+  schedule: ['before 6am on monday'],
+  prConcurrentLimit: 5,
+  labels: ['dependencies'],
+
+  assignees: ['SebastianThomas'],
+  reviewers: ['SebastianThomas'],
+  assignAutomerge: true,
+
+  // The Kubernetes manager has no default file patterns. These are the only
+  // directories containing Kubernetes resources in this repository.
+  kubernetes: {
+    managerFilePatterns: [
+      '/^db/.+\\.ya?ml$/',
+      '/^deploy/.+\\.ya?ml$/',
+    ],
+  },
+
+  packageRules: [
+    // Rust runtime and build dependencies affect the primary service. Keep
+    // compatible updates together, but require a person to review them.
+    {
+      matchManagers: ['cargo'],
+      matchUpdateTypes: ['minor', 'patch'],
+      groupName: 'rust dependencies',
+    },
+    // PEP 621 handles pyproject.toml and refreshes uv.lock for the local ML
+    // service. These are deployed dependencies and therefore stay manual.
+    {
+      matchManagers: ['pep621'],
+      matchUpdateTypes: ['minor', 'patch'],
+      groupName: 'local ML dependencies',
+    },
+    // The full workflow suite exercises action updates. Give new releases a
+    // short settling period before allowing Renovate to merge them.
+    {
+      matchManagers: ['github-actions'],
+      matchUpdateTypes: ['minor', 'patch', 'digest'],
+      groupName: 'github-actions',
+      automerge: true,
+      minimumReleaseAge: '3 days',
+      minimumReleaseAgeBehaviour: 'timestamp-optional',
+    },
+    // Base, Compose, init-container and sidecar images ship to production, so
+    // group compatible updates while keeping human review mandatory.
+    {
+      matchManagers: ['dockerfile', 'docker-compose', 'kubernetes'],
+      matchUpdateTypes: ['minor', 'patch', 'digest'],
+      groupName: 'container and Kubernetes images',
+    },
+    // PostgreSQL data directories are not portable across major versions.
+    // Major upgrades require an explicit CNPG migration and restore exercise.
+    {
+      matchPackageNames: ['postgres'],
+      matchUpdateTypes: ['major'],
+      enabled: false,
+    },
+  ],
+}
