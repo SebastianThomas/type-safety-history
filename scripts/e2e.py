@@ -13,9 +13,11 @@ BASE_URL = os.getenv("E2E_BASE_URL", "http://127.0.0.1:8081")
 TOKEN = os.getenv("E2E_CURATOR_TOKEN", "ci-only-token")
 
 
-def request(method: str, path: str, payload: object | None = None) -> object | None:
+def request(
+    method: str, path: str, payload: object | None = None, token: str = TOKEN
+) -> object | None:
     body = None if payload is None else json.dumps(payload).encode()
-    headers = {"Authorization": f"Bearer {TOKEN}"}
+    headers = {"Authorization": f"Bearer {token}"}
     if body is not None:
         headers["Content-Type"] = "application/json"
     call = urllib.request.Request(
@@ -99,7 +101,9 @@ def wait_for(path: str, predicate, timeout: float = 30) -> object:
     raise AssertionError(f"timed out waiting for {path}")
 
 
-def create_work(title: str, doi: str, source_url: str) -> dict[str, object]:
+def create_work(
+    title: str, doi: str, source_url: str, token: str = TOKEN
+) -> dict[str, object]:
     return request(
         "POST",
         "/api/v1/works",
@@ -116,16 +120,35 @@ def create_work(title: str, doi: str, source_url: str) -> dict[str, object]:
             "ml_use_permitted": False,
             "redistribution_permitted": False,
         },
+        token,
     )
 
 
 def main() -> None:
     initial_counts = request("GET", "/api/v1/stats/overview")["counts"]
     suffix = uuid4().hex
+    user = request(
+        "POST",
+        "/api/v1/admin/users",
+        {
+            "username": f"ci_{suffix[:12]}",
+            "display_name": "CI curator",
+            "role": "curator",
+        },
+    )
+    issued = request(
+        "POST",
+        f"/api/v1/admin/users/{user['id']}/tokens",
+        {"label": "end-to-end", "expires_at": None},
+    )
+    curator_token = issued["token"]
+    principal = request("GET", "/api/v1/auth/me", token=curator_token)
+    assert principal["role"] == "curator" and not principal["bootstrap"]
     canonical = create_work(
         "A Syntactic Approach to Type Soundness",
         f"10.9999/{suffix}-canonical",
         f"https://example.invalid/{suffix}/canonical",
+        curator_token,
     )
     duplicate = create_work(
         "A Syntactic Approach to Type-Soundness",
@@ -185,6 +208,26 @@ def main() -> None:
         f"/api/v1/documents/{document['document_id']}/takedown",
         {"actor": "ci-e2e", "reason": "Generated fixture cleanup"},
     )
+    retained = upload(
+        "/api/v1/documents/upload",
+        {
+            "work_id": canonical["id"],
+            "source_url": f"https://example.invalid/{suffix}/retained-paper",
+            "source_kind": "curator_upload",
+            "reliability": "primary",
+            "rights_status": "open_redistributable",
+            "license_name": "CC0-1.0",
+            "license_url": "https://creativecommons.org/publicdomain/zero/1.0/",
+            "rights_basis": "Generated retained CI fixture released as CC0.",
+            "ml_use_permitted": True,
+            "redistribution_permitted": True,
+        },
+        simple_pdf(f"Subject reduction is preservation. Retained run {suffix}."),
+    )
+    wait_for(
+        "/api/v1/proof-results/candidates",
+        lambda rows: any(row.get("work_id") == canonical["id"] for row in rows),
+    )
     overview = request("GET", "/api/v1/stats/overview")
     assert (
         overview["counts"]["documents_taken_down"]
@@ -194,11 +237,31 @@ def main() -> None:
         overview["counts"]["proofs_rejected"] >= initial_counts["proofs_rejected"] + 2
     )
     assert overview["counts"]["discovered"] >= 2
+    assert (
+        overview["counts"]["active_documents"] >= initial_counts["active_documents"] + 1
+    )
+    assert retained["document_id"]
     evolution = request("GET", "/api/v1/stats/evolution?days=7")
     assert len(evolution["series"]) == 7
+    assert (
+        evolution["series"][-1]["proofs_approved"]
+        == overview["counts"]["proofs_approved"]
+    )
+    assert evolution["series"][-1]["queued_jobs"] == overview["counts"]["queued_jobs"]
     with urllib.request.urlopen(BASE_URL + "/dashboard", timeout=10) as response:
         dashboard = response.read().decode()
     assert "Research funnel" in dashboard and "Corpus growth" in dashboard
+    request(
+        "POST",
+        f"/api/v1/admin/tokens/{issued['id']}/revoke",
+        {"reason": "End-to-end revocation check"},
+    )
+    try:
+        request("GET", "/api/v1/auth/me", token=curator_token)
+    except AssertionError as error:
+        assert "401" in str(error)
+    else:
+        raise AssertionError("revoked curator token remained valid")
     print("end-to-end lifecycle passed")
 
 

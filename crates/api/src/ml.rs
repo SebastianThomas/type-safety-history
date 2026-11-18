@@ -9,10 +9,7 @@ use serde_json::{Value, json};
 use sqlx::FromRow;
 use uuid::Uuid;
 
-use crate::{
-    AppState,
-    routes::{ApiError, require_curator},
-};
+use crate::{AppState, auth::require_curator, routes::ApiError};
 
 pub(crate) fn router() -> Router<AppState> {
     Router::new()
@@ -53,7 +50,7 @@ async fn document_similarities(
     headers: HeaderMap,
     Path(id): Path<Uuid>,
 ) -> Result<Json<Vec<DocumentSimilarity>>, ApiError> {
-    require_curator(&state, &headers)?;
+    require_curator(&state, &headers).await?;
     let rows = sqlx::query_as::<_, DocumentSimilarity>(
         "SELECT CASE WHEN left_document_id = $1 THEN right_document_id \
                 ELSE left_document_id END AS document_id, score, algorithm \
@@ -95,7 +92,7 @@ async fn citation_candidates(
     headers: HeaderMap,
     Query(page): Query<Page>,
 ) -> Result<Json<Vec<CitationCandidate>>, ApiError> {
-    require_curator(&state, &headers)?;
+    require_curator(&state, &headers).await?;
     let rows = sqlx::query_as::<_, CitationCandidate>(
         "SELECT id, citing_work_id, source_document_id, page, cited_doi, \
          context_sha256, status::text AS status FROM citation_candidates \
@@ -111,7 +108,8 @@ async fn citation_candidates(
 #[derive(Deserialize)]
 struct Resolution {
     decision: String,
-    actor: String,
+    #[serde(default, rename = "actor")]
+    _actor: String,
     reason: String,
 }
 
@@ -121,7 +119,7 @@ async fn resolve_citation_candidate(
     Path(id): Path<Uuid>,
     Json(input): Json<Resolution>,
 ) -> Result<StatusCode, ApiError> {
-    require_curator(&state, &headers)?;
+    let principal = require_curator(&state, &headers).await?;
     validate_resolution(&input)?;
     let mut tx = state.db.begin().await?;
     let row: (Uuid, Uuid, String) = sqlx::query_as(
@@ -152,7 +150,7 @@ async fn resolve_citation_candidate(
         .bind(row.0)
         .bind(cited_work_id)
         .bind(row.1)
-        .bind(input.actor.trim())
+        .bind(principal.username())
         .bind(input.reason.trim())
         .execute(&mut *tx)
         .await?;
@@ -165,7 +163,15 @@ async fn resolve_citation_candidate(
         .bind(status)
         .execute(&mut *tx)
         .await?;
-    audit_resolution(&mut tx, &input, "citation_candidate", id, status).await?;
+    audit_resolution(
+        &mut tx,
+        principal.username(),
+        &input,
+        "citation_candidate",
+        id,
+        status,
+    )
+    .await?;
     tx.commit().await?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -185,7 +191,7 @@ async fn entity_resolution_suggestions(
     headers: HeaderMap,
     Query(page): Query<Page>,
 ) -> Result<Json<Vec<EntitySuggestion>>, ApiError> {
-    require_curator(&state, &headers)?;
+    require_curator(&state, &headers).await?;
     let rows = sqlx::query_as::<_, EntitySuggestion>(
         "SELECT id, discovery_candidate_id, work_id, score, method, rationale \
          FROM entity_resolution_suggestions WHERE status = 'pending' \
@@ -204,7 +210,7 @@ async fn resolve_entity_suggestion(
     Path(id): Path<Uuid>,
     Json(input): Json<Resolution>,
 ) -> Result<StatusCode, ApiError> {
-    require_curator(&state, &headers)?;
+    let principal = require_curator(&state, &headers).await?;
     validate_resolution(&input)?;
     let status = if input.decision == "accept" {
         "accepted"
@@ -220,7 +226,7 @@ async fn resolve_entity_suggestion(
     )
     .bind(id)
     .bind(status)
-    .bind(input.actor.trim())
+    .bind(principal.username())
     .bind(input.reason.trim())
     .fetch_optional(&mut *tx)
     .await?
@@ -236,7 +242,15 @@ async fn resolve_entity_suggestion(
         .execute(&mut *tx)
         .await?;
     }
-    audit_resolution(&mut tx, &input, "entity_resolution_suggestion", id, status).await?;
+    audit_resolution(
+        &mut tx,
+        principal.username(),
+        &input,
+        "entity_resolution_suggestion",
+        id,
+        status,
+    )
+    .await?;
     tx.commit().await?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -247,14 +261,15 @@ fn validate_resolution(input: &Resolution) -> Result<(), ApiError> {
             "decision must be accept or reject".into(),
         ));
     }
-    if input.actor.trim().is_empty() || input.reason.trim().is_empty() {
-        return Err(ApiError::BadRequest("actor and reason are required".into()));
+    if input.reason.trim().is_empty() {
+        return Err(ApiError::BadRequest("reason is required".into()));
     }
     Ok(())
 }
 
 async fn audit_resolution(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    actor: &str,
     input: &Resolution,
     entity_type: &str,
     id: Uuid,
@@ -265,7 +280,7 @@ async fn audit_resolution(
          (actor, action, entity_type, entity_id, after_value, reason) \
          VALUES ($1, 'resolve', $2, $3, $4, $5)",
     )
-    .bind(input.actor.trim())
+    .bind(actor)
     .bind(entity_type)
     .bind(id)
     .bind(json!({"status": status}))
@@ -280,7 +295,8 @@ struct CreateLabel {
     proof_result_id: Uuid,
     expected_result_kind: String,
     is_relevant: bool,
-    labelled_by: String,
+    #[serde(default, rename = "labelled_by")]
+    _labelled_by: String,
     notes: Option<String>,
 }
 
@@ -289,10 +305,10 @@ async fn create_label(
     headers: HeaderMap,
     Json(input): Json<CreateLabel>,
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
-    require_curator(&state, &headers)?;
-    if input.expected_result_kind.trim().is_empty() || input.labelled_by.trim().is_empty() {
+    let principal = require_curator(&state, &headers).await?;
+    if input.expected_result_kind.trim().is_empty() {
         return Err(ApiError::BadRequest(
-            "expected_result_kind and labelled_by are required".into(),
+            "expected_result_kind is required".into(),
         ));
     }
     let id: Uuid = sqlx::query_scalar(
@@ -307,7 +323,7 @@ async fn create_label(
     .bind(input.proof_result_id)
     .bind(input.expected_result_kind.trim())
     .bind(input.is_relevant)
-    .bind(input.labelled_by.trim())
+    .bind(principal.username())
     .bind(input.notes)
     .fetch_one(&state.db)
     .await?;
@@ -334,7 +350,7 @@ async fn list_evaluations(
     headers: HeaderMap,
     Query(page): Query<Page>,
 ) -> Result<Json<Vec<Evaluation>>, ApiError> {
-    require_curator(&state, &headers)?;
+    require_curator(&state, &headers).await?;
     let rows = sqlx::query_as::<_, Evaluation>(
         "SELECT id, pipeline_version, labelled_examples, true_positives, false_positives, \
          false_negatives, precision, recall, f1, details, created_at::text AS created_at \
@@ -351,7 +367,7 @@ async fn queue_evaluation(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
-    require_curator(&state, &headers)?;
+    require_curator(&state, &headers).await?;
     queue_job(&state, "evaluate_local_classifier").await
 }
 
@@ -360,7 +376,7 @@ async fn queue_ml_job(
     headers: HeaderMap,
     Path(kind): Path<String>,
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
-    require_curator(&state, &headers)?;
+    require_curator(&state, &headers).await?;
     let job_type = match kind.as_str() {
         "entity-resolution" => "resolve_discovery_entities",
         "duplicate-detection" => "resolve_work_duplicates",

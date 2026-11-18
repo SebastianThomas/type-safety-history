@@ -10,10 +10,7 @@ use serde::Deserialize;
 use serde_json::json;
 use uuid::Uuid;
 
-use crate::{
-    AppState,
-    routes::{ApiError, require_curator},
-};
+use crate::{AppState, auth::require_curator, routes::ApiError};
 
 pub(crate) fn router() -> Router<AppState> {
     Router::new().route("/api/v1/documents/{id}/takedown", post(take_down_document))
@@ -21,7 +18,8 @@ pub(crate) fn router() -> Router<AppState> {
 
 #[derive(Deserialize)]
 struct TakedownRequest {
-    actor: String,
+    #[serde(default, rename = "actor")]
+    _actor: String,
     reason: String,
 }
 
@@ -31,9 +29,9 @@ async fn take_down_document(
     Path(document_id): Path<Uuid>,
     Json(input): Json<TakedownRequest>,
 ) -> Result<StatusCode, ApiError> {
-    require_curator(&state, &headers)?;
-    if input.actor.trim().is_empty() || input.reason.trim().is_empty() {
-        return Err(ApiError::BadRequest("actor and reason are required".into()));
+    let principal = require_curator(&state, &headers).await?;
+    if input.reason.trim().is_empty() {
+        return Err(ApiError::BadRequest("reason is required".into()));
     }
 
     let mut tx = state.db.begin().await?;
@@ -115,7 +113,7 @@ async fn take_down_document(
              redistribution_permitted = false WHERE id = $1",
         )
         .bind(document_id)
-        .bind(input.actor.trim())
+        .bind(principal.username())
         .bind(input.reason.trim())
         .execute(&mut *tx)
         .await?;
@@ -124,7 +122,7 @@ async fn take_down_document(
              (actor, action, entity_type, entity_id, after_value, reason) \
              VALUES ($1, 'takedown', 'document', $2, $3, $4)",
         )
-        .bind(input.actor.trim())
+        .bind(principal.username())
         .bind(document_id)
         .bind(json!({"status": "taken_down", "object_removed": moved}))
         .bind(input.reason.trim())

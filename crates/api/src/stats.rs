@@ -96,6 +96,10 @@ struct EvolutionPoint {
     proof_results: i64,
     approval_events: i64,
     coverage_runs: i64,
+    discovery_pending: i64,
+    proof_candidates: i64,
+    proofs_approved: i64,
+    queued_jobs: i64,
 }
 
 async fn load_evolution(state: &AppState, days: i32) -> Result<Vec<EvolutionPoint>, ApiError> {
@@ -111,8 +115,19 @@ async fn load_evolution(state: &AppState, days: i32) -> Result<Vec<EvolutionPoin
               (SELECT count(*) FROM audit_log a WHERE a.entity_type = 'proof_result'
                   AND a.after_value->>'status' = 'curator_approved'
                   AND a.occurred_at < days.day + 1) AS approval_events,
-              (SELECT count(*) FROM coverage_runs cr WHERE cr.finished_at < days.day + 1) AS coverage_runs
-           FROM days ORDER BY days.day"#,
+              (SELECT count(*) FROM coverage_runs cr WHERE cr.finished_at < days.day + 1) AS coverage_runs,
+              COALESCE(snapshot.discovery_pending, 0) AS discovery_pending,
+              COALESCE(snapshot.proof_candidates, 0) AS proof_candidates,
+              COALESCE(snapshot.proofs_approved, 0) AS proofs_approved,
+              COALESCE(snapshot.queued_jobs, 0) AS queued_jobs
+           FROM days
+           LEFT JOIN LATERAL (
+              SELECT discovery_pending, proof_candidates, proofs_approved, queued_jobs
+              FROM corpus_metric_snapshots snapshot
+              WHERE snapshot.recorded_at < days.day + 1
+              ORDER BY snapshot.recorded_at DESC LIMIT 1
+           ) snapshot ON true
+           ORDER BY days.day"#,
     )
     .bind(days)
     .fetch_all(&state.db)
@@ -128,7 +143,7 @@ async fn evolution(
     Ok(Json(json!({
         "days": days,
         "series": points,
-        "note": "Series are cumulative event counts. Current review backlogs are reported by /api/v1/stats/overview."
+        "note": "Discovery/work/proof/approval series are cumulative. Pending and queue series are durable minute-bucketed state snapshots."
     })))
 }
 
@@ -136,6 +151,7 @@ async fn dashboard(State(state): State<AppState>) -> Result<Html<String>, ApiErr
     let counts = load_overview(&state).await?;
     let points = load_evolution(&state, 365).await?;
     let chart = svg_chart(&points);
+    let backlog_chart = svg_backlog_chart(&points);
     let recent = points
         .iter()
         .rev()
@@ -144,10 +160,10 @@ async fn dashboard(State(state): State<AppState>) -> Result<Html<String>, ApiErr
             format!(
                 "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
                 point.day,
-                point.discovered,
-                point.works,
-                point.proof_results,
-                point.approval_events
+                point.discovery_pending,
+                point.proof_candidates,
+                point.proofs_approved,
+                point.queued_jobs
             )
         })
         .collect::<String>();
@@ -192,7 +208,10 @@ th,td{{text-align:right;padding:8px 10px;border-bottom:1px solid var(--line)}} t
 <section class="panel"><h2>Corpus growth</h2>
 <div class="legend"><span><i class="dot" style="background:#285f8f"></i>Found</span><span><i class="dot" style="background:#39755a"></i>Works</span><span><i class="dot" style="background:#a66b19"></i>Proof results</span><span><i class="dot" style="background:#a64536"></i>Approval events</span></div>
 {chart}</section>
-<section class="panel"><h2>Last 14 days</h2><table><thead><tr><th>Date</th><th>Found</th><th>Works</th><th>Proof results</th><th>Approvals</th></tr></thead><tbody>{recent}</tbody></table></section>
+<section class="panel"><h2>Review backlog over time</h2>
+<div class="legend"><span><i class="dot" style="background:#285f8f"></i>Pending discovery</span><span><i class="dot" style="background:#a66b19"></i>Proof candidates</span><span><i class="dot" style="background:#a64536"></i>Active jobs</span></div>
+{backlog_chart}</section>
+<section class="panel"><h2>Last 14 days</h2><table><thead><tr><th>Date</th><th>Pending discovery</th><th>Proof queue</th><th>Approved proofs</th><th>Active jobs</th></tr></thead><tbody>{recent}</tbody></table></section>
 <section class="panel"><h2>Review queues</h2><div class="funnel">
 <div class="stage"><span>Duplicate suggestions</span><strong>{duplicates}</strong></div>
 <div class="stage"><span>Entity suggestions</span><strong>{entities}</strong></div>
@@ -222,17 +241,44 @@ th,td{{text-align:right;padding:8px 10px;border-bottom:1px solid var(--line)}} t
 }
 
 fn svg_chart(points: &[EvolutionPoint]) -> String {
+    svg_lines(
+        points,
+        &[
+            (|point: &EvolutionPoint| point.discovered, "#285f8f"),
+            (|point: &EvolutionPoint| point.works, "#39755a"),
+            (|point: &EvolutionPoint| point.proof_results, "#a66b19"),
+            (|point: &EvolutionPoint| point.approval_events, "#a64536"),
+        ],
+        "Cumulative corpus growth over 365 days",
+    )
+}
+
+fn svg_backlog_chart(points: &[EvolutionPoint]) -> String {
+    svg_lines(
+        points,
+        &[
+            (|point: &EvolutionPoint| point.discovery_pending, "#285f8f"),
+            (|point: &EvolutionPoint| point.proof_candidates, "#a66b19"),
+            (|point: &EvolutionPoint| point.queued_jobs, "#a64536"),
+        ],
+        "Review backlog over 365 days",
+    )
+}
+
+type Metric = fn(&EvolutionPoint) -> i64;
+
+fn svg_lines(points: &[EvolutionPoint], series: &[(Metric, &str)], label: &str) -> String {
     let width = 1000_f64;
     let height = 300_f64;
     let inset = 28_f64;
     let maximum = points
         .iter()
         .map(|point| {
-            point
-                .discovered
-                .max(point.works)
-                .max(point.proof_results)
-                .max(point.approval_events)
+            series
+                .iter()
+                .map(|(value, _)| value(point))
+                .max()
+                .unwrap_or(0)
         })
         .max()
         .unwrap_or(1)
@@ -254,17 +300,17 @@ fn svg_chart(points: &[EvolutionPoint]) -> String {
             r#"<polyline points="{coordinates}" fill="none" stroke="{color}" stroke-width="3" vector-effect="non-scaling-stroke"/>"#
         )
     };
+    let paths = series
+        .iter()
+        .map(|(value, color)| line(*value, color))
+        .collect::<String>();
     format!(
-        r##"<svg viewBox="0 0 1000 300" role="img" aria-label="Cumulative corpus growth over 365 days">
+        r##"<svg viewBox="0 0 1000 300" role="img" aria-label="{label}">
 <line x1="28" y1="272" x2="972" y2="272" stroke="#d8d2c4"/>
 <line x1="28" y1="28" x2="28" y2="272" stroke="#d8d2c4"/>
-{}{}{}{}
+{paths}
 <text x="30" y="22" fill="#687482" font-size="12">max {}</text>
 </svg>"##,
-        line(|point| point.discovered, "#285f8f"),
-        line(|point| point.works, "#39755a"),
-        line(|point| point.proof_results, "#a66b19"),
-        line(|point| point.approval_events, "#a64536"),
         maximum as i64
     )
 }

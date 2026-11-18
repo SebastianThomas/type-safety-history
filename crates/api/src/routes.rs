@@ -16,6 +16,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use uuid::Uuid;
 
 use crate::AppState;
+use crate::auth::require_curator;
 use crate::crossref::CrossrefError;
 
 pub(crate) fn router() -> Router<AppState> {
@@ -43,6 +44,7 @@ pub(crate) fn router() -> Router<AppState> {
         .route("/api/v1/timeline", get(timeline))
         .route("/api/v1/exports", post(create_export))
         .route("/api/v1/exports/{id}", get(get_export))
+        .merge(crate::auth::router())
         .merge(crate::lifecycle::router())
         .merge(crate::ml::router())
         .merge(crate::research::router())
@@ -149,7 +151,7 @@ async fn create_work(
     headers: HeaderMap,
     Json(input): Json<CreateWork>,
 ) -> Result<(StatusCode, Json<Work>), ApiError> {
-    require_curator(&state, &headers)?;
+    require_curator(&state, &headers).await?;
     if input.title.trim().is_empty() || input.source_url.trim().is_empty() {
         return Err(ApiError::BadRequest(
             "title and source_url are required".into(),
@@ -226,7 +228,7 @@ async fn discover_crossref(
     headers: HeaderMap,
     Json(input): Json<CrossrefDiscoveryRequest>,
 ) -> Result<Json<Value>, ApiError> {
-    require_curator(&state, &headers)?;
+    require_curator(&state, &headers).await?;
     let query = input.query.trim();
     if !(3..=200).contains(&query.len()) {
         return Err(ApiError::BadRequest(
@@ -371,7 +373,7 @@ async fn list_discovery_candidates(
     headers: HeaderMap,
     Query(page): Query<DiscoveryPagination>,
 ) -> Result<Json<Vec<DiscoveryCandidate>>, ApiError> {
-    require_curator(&state, &headers)?;
+    require_curator(&state, &headers).await?;
     if !matches!(page.status.as_str(), "pending" | "imported" | "rejected") {
         return Err(ApiError::BadRequest("invalid discovery status".into()));
     }
@@ -393,7 +395,8 @@ async fn list_discovery_candidates(
 
 #[derive(Deserialize)]
 struct RejectDiscoveryCandidate {
-    actor: String,
+    #[serde(default, rename = "actor")]
+    _actor: String,
     reason: String,
 }
 
@@ -403,9 +406,9 @@ async fn reject_discovery_candidate(
     AxumPath(id): AxumPath<Uuid>,
     Json(input): Json<RejectDiscoveryCandidate>,
 ) -> Result<StatusCode, ApiError> {
-    require_curator(&state, &headers)?;
-    if input.actor.trim().is_empty() || input.reason.trim().is_empty() {
-        return Err(ApiError::BadRequest("actor and reason are required".into()));
+    let principal = require_curator(&state, &headers).await?;
+    if input.reason.trim().is_empty() {
+        return Err(ApiError::BadRequest("reason is required".into()));
     }
     let mut tx = state.db.begin().await?;
     let updated = sqlx::query(
@@ -424,7 +427,7 @@ async fn reject_discovery_candidate(
          (actor, action, entity_type, entity_id, after_value, reason) \
          VALUES ($1, 'reject', 'discovery_candidate', $2, $3, $4)",
     )
-    .bind(input.actor.trim())
+    .bind(principal.username())
     .bind(id)
     .bind(json!({"status": "rejected"}))
     .bind(input.reason.trim())
@@ -454,7 +457,7 @@ async fn register_document(
     headers: HeaderMap,
     Json(input): Json<RegisterDocument>,
 ) -> Result<(StatusCode, Json<RegisteredDocument>), ApiError> {
-    require_curator(&state, &headers)?;
+    require_curator(&state, &headers).await?;
     validate_object_key(&input.object_key)?;
     if input.sha256.len() != 64 || !input.sha256.bytes().all(|b| b.is_ascii_hexdigit()) {
         return Err(ApiError::BadRequest(
@@ -560,7 +563,7 @@ async fn upload_document(
     headers: HeaderMap,
     mut multipart: Multipart,
 ) -> Result<(StatusCode, Json<RegisteredDocument>), ApiError> {
-    require_curator(&state, &headers)?;
+    require_curator(&state, &headers).await?;
     let mut metadata: Option<UploadMetadata> = None;
     let mut uploaded: Option<UploadedFile> = None;
 
@@ -890,7 +893,7 @@ async fn import_crossref(
     headers: HeaderMap,
     Json(input): Json<CrossrefImportRequest>,
 ) -> Result<(StatusCode, Json<CrossrefImportResponse>), ApiError> {
-    require_curator(&state, &headers)?;
+    require_curator(&state, &headers).await?;
     let doi = normalize_doi(&input.doi);
     if !doi.starts_with("10.") || !doi.contains('/') || doi.len() > 255 {
         return Err(ApiError::BadRequest("invalid DOI".into()));
@@ -1076,7 +1079,7 @@ async fn list_candidates(
     headers: HeaderMap,
     Query(page): Query<Pagination>,
 ) -> Result<Json<Vec<ProofCandidate>>, ApiError> {
-    require_curator(&state, &headers)?;
+    require_curator(&state, &headers).await?;
     let candidates = sqlx::query_as::<_, ProofCandidate>(
         "SELECT id, work_id, theorem_name, result_kind, proof_method, statement_summary, \
          confidence, classifier_version, created_at::text AS created_at \
@@ -1120,7 +1123,7 @@ async fn get_proof_result(
     headers: HeaderMap,
     AxumPath(id): AxumPath<Uuid>,
 ) -> Result<Json<Value>, ApiError> {
-    require_curator(&state, &headers)?;
+    require_curator(&state, &headers).await?;
     let result = sqlx::query_as::<_, ProofResultDetail>(
         "SELECT id, work_id, source_document_id, theorem_name, result_kind, proof_method, \
          statement_summary, status::text AS status, confidence, classifier_version \
@@ -1157,7 +1160,8 @@ struct CreateCuratedProof {
     char_end: Option<i32>,
     content_sha256: Option<String>,
     evidence_paraphrase: String,
-    actor: String,
+    #[serde(default, rename = "actor")]
+    _actor: String,
     reason: String,
 }
 
@@ -1166,7 +1170,7 @@ async fn create_curated_proof(
     headers: HeaderMap,
     Json(input): Json<CreateCuratedProof>,
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
-    require_curator(&state, &headers)?;
+    let principal = require_curator(&state, &headers).await?;
     validate_curated_proof(&input)?;
     let mut tx = state.db.begin().await?;
     let reliable_document_exists: bool = sqlx::query_scalar(
@@ -1229,7 +1233,7 @@ async fn create_curated_proof(
     .bind(proof_result_id)
     .bind(span_id)
     .bind(input.evidence_paraphrase.trim())
-    .bind(input.actor.trim())
+    .bind(principal.username())
     .execute(&mut *tx)
     .await?;
     sqlx::query(
@@ -1237,7 +1241,7 @@ async fn create_curated_proof(
          (actor, action, entity_type, entity_id, after_value, reason) \
          VALUES ($1, 'create_curated_proof', 'proof_result', $2, $3, $4)",
     )
-    .bind(input.actor.trim())
+    .bind(principal.username())
     .bind(proof_result_id)
     .bind(json!({"status": "curator_approved", "document_id": input.document_id}))
     .bind(input.reason.trim())
@@ -1289,8 +1293,8 @@ fn validate_curated_proof(input: &CreateCuratedProof) -> Result<(), ApiError> {
             "evidence_paraphrase must contain 1-500 characters".into(),
         ));
     }
-    if input.actor.trim().is_empty() || input.reason.trim().is_empty() {
-        return Err(ApiError::BadRequest("actor and reason are required".into()));
+    if input.reason.trim().is_empty() {
+        return Err(ApiError::BadRequest("reason is required".into()));
     }
     let allowed_obligations = [
         "progress",
@@ -1364,7 +1368,8 @@ async fn timeline(
 
 #[derive(Deserialize)]
 struct CreateExport {
-    requested_by: String,
+    #[serde(default, rename = "requested_by")]
+    _requested_by: String,
 }
 
 #[derive(Serialize, FromRow)]
@@ -1384,12 +1389,9 @@ struct ExportRecord {
 async fn create_export(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Json(input): Json<CreateExport>,
+    Json(_input): Json<CreateExport>,
 ) -> Result<(StatusCode, Json<ExportRecord>), ApiError> {
-    require_curator(&state, &headers)?;
-    if input.requested_by.trim().is_empty() {
-        return Err(ApiError::BadRequest("requested_by is required".into()));
-    }
+    let principal = require_curator(&state, &headers).await?;
     let mut tx = state.db.begin().await?;
     let record = sqlx::query_as::<_, ExportRecord>(
         "INSERT INTO exports (export_kind, requested_by) \
@@ -1397,7 +1399,7 @@ async fn create_export(
          RETURNING id, export_kind, status::text AS status, object_key, sha256, row_count, \
          requested_by, error, created_at::text AS created_at, finished_at::text AS finished_at",
     )
-    .bind(input.requested_by.trim())
+    .bind(principal.username())
     .fetch_one(&mut *tx)
     .await?;
     sqlx::query(
@@ -1417,7 +1419,7 @@ async fn get_export(
     headers: HeaderMap,
     AxumPath(id): AxumPath<Uuid>,
 ) -> Result<Json<ExportRecord>, ApiError> {
-    require_curator(&state, &headers)?;
+    require_curator(&state, &headers).await?;
     let record = sqlx::query_as::<_, ExportRecord>(
         "SELECT id, export_kind, status::text AS status, object_key, sha256, row_count, \
          requested_by, error, created_at::text AS created_at, finished_at::text AS finished_at \
@@ -1433,7 +1435,8 @@ async fn get_export(
 #[derive(Deserialize)]
 struct ReviewCandidate {
     decision: String,
-    actor: String,
+    #[serde(default, rename = "actor")]
+    _actor: String,
     reason: String,
 }
 
@@ -1443,15 +1446,15 @@ async fn review_candidate(
     AxumPath(id): AxumPath<Uuid>,
     Json(input): Json<ReviewCandidate>,
 ) -> Result<StatusCode, ApiError> {
-    require_curator(&state, &headers)?;
+    let principal = require_curator(&state, &headers).await?;
     let status = match input.decision.as_str() {
         "approve" => "curator_approved",
         "reject" => "rejected",
         "dispute" => "disputed",
         _ => return Err(ApiError::BadRequest("invalid review decision".into())),
     };
-    if input.actor.trim().is_empty() || input.reason.trim().is_empty() {
-        return Err(ApiError::BadRequest("actor and reason are required".into()));
+    if input.reason.trim().is_empty() {
+        return Err(ApiError::BadRequest("reason is required".into()));
     }
     let mut tx = state.db.begin().await?;
     let previous: String =
@@ -1470,7 +1473,7 @@ async fn review_candidate(
          (actor, action, entity_type, entity_id, before_value, after_value, reason) \
          VALUES ($1, 'review', 'proof_result', $2, $3, $4, $5)",
     )
-    .bind(input.actor.trim())
+    .bind(principal.username())
     .bind(id)
     .bind(json!({"status": previous}))
     .bind(json!({"status": status}))
@@ -1479,22 +1482,6 @@ async fn review_candidate(
     .await?;
     tx.commit().await?;
     Ok(StatusCode::NO_CONTENT)
-}
-
-pub(crate) fn require_curator(state: &AppState, headers: &HeaderMap) -> Result<(), ApiError> {
-    let configured = state
-        .curator_token
-        .as_deref()
-        .ok_or(ApiError::NotConfigured("CURATOR_TOKEN must be configured"))?;
-    let supplied = headers
-        .get(axum::http::header::AUTHORIZATION)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.strip_prefix("Bearer "))
-        .ok_or(ApiError::Unauthorized)?;
-    if supplied.as_bytes() != configured.as_bytes() {
-        return Err(ApiError::Unauthorized);
-    }
-    Ok(())
 }
 
 fn normalize_orcid(orcid: &str) -> String {
@@ -1551,6 +1538,8 @@ pub(crate) enum ApiError {
     BadRequest(String),
     #[error("unauthorized")]
     Unauthorized,
+    #[error("forbidden")]
+    Forbidden,
     #[error("service is not configured: {0}")]
     NotConfigured(&'static str),
     #[error("upstream service error: {0}")]
@@ -1569,6 +1558,7 @@ impl IntoResponse for ApiError {
             Self::NotFound => (StatusCode::NOT_FOUND, "not found".to_string()),
             Self::BadRequest(message) => (StatusCode::BAD_REQUEST, message),
             Self::Unauthorized => (StatusCode::UNAUTHORIZED, "unauthorized".into()),
+            Self::Forbidden => (StatusCode::FORBIDDEN, "forbidden".into()),
             Self::NotConfigured(message) => (StatusCode::SERVICE_UNAVAILABLE, message.into()),
             Self::Upstream(message) => (StatusCode::BAD_GATEWAY, message),
             Self::Crossref(CrossrefError::NotFound) => (

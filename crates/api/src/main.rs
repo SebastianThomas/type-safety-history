@@ -1,4 +1,6 @@
+mod auth;
 mod crossref;
+mod integrity;
 mod lifecycle;
 mod ml;
 mod research;
@@ -44,6 +46,11 @@ async fn main() -> Result<()> {
                 "usage: api seed <seed-file.json>"
             );
             return seed::run(Path::new(&path)).await;
+        }
+        Some("verify-storage") => {
+            init_tracing();
+            anyhow::ensure!(arguments.next().is_none(), "usage: api verify-storage");
+            return integrity::run().await;
         }
         Some(command) => anyhow::bail!("unknown command: {command}"),
         None => {}

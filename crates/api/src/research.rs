@@ -9,10 +9,7 @@ use serde_json::{Value, json};
 use sqlx::FromRow;
 use uuid::Uuid;
 
-use crate::{
-    AppState,
-    routes::{ApiError, require_curator},
-};
+use crate::{AppState, auth::require_curator, routes::ApiError};
 
 pub(crate) fn router() -> Router<AppState> {
     Router::new()
@@ -53,6 +50,7 @@ struct CreateWorkVersion {
     published_at: Option<String>,
     #[serde(default)]
     is_canonical: bool,
+    #[serde(default)]
     actor: String,
     reason: String,
 }
@@ -62,7 +60,7 @@ async fn create_work_version(
     headers: HeaderMap,
     Json(input): Json<CreateWorkVersion>,
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
-    require_curator(&state, &headers)?;
+    let principal = require_curator(&state, &headers).await?;
     require_actor_reason(&input.actor, &input.reason)?;
     if input.version_label.trim().is_empty() {
         return Err(ApiError::BadRequest("version_label is required".into()));
@@ -86,7 +84,7 @@ async fn create_work_version(
     .await?;
     audit(
         &mut tx,
-        &input.actor,
+        principal.username(),
         "create_version",
         "work_version",
         id,
@@ -107,6 +105,7 @@ struct CreateWorkRelation {
     relation_kind: String,
     evidence_source_id: Option<Uuid>,
     notes: Option<String>,
+    #[serde(default)]
     actor: String,
     reason: String,
 }
@@ -116,7 +115,7 @@ async fn create_work_relation(
     headers: HeaderMap,
     Json(input): Json<CreateWorkRelation>,
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
-    require_curator(&state, &headers)?;
+    let principal = require_curator(&state, &headers).await?;
     require_actor_reason(&input.actor, &input.reason)?;
     if !matches!(
         input.relation_kind.as_str(),
@@ -142,12 +141,12 @@ async fn create_work_relation(
     .bind(&input.relation_kind)
     .bind(input.evidence_source_id)
     .bind(input.notes.as_deref().map(str::trim))
-    .bind(input.actor.trim())
+    .bind(principal.username())
     .fetch_one(&mut *tx)
     .await?;
     audit(
         &mut tx,
-        &input.actor,
+        principal.username(),
         "create_relation",
         "work_relation",
         id,
@@ -167,6 +166,7 @@ struct CreateCitation {
     cited_work_id: Uuid,
     source_document_id: Option<Uuid>,
     evidence_span_id: Option<Uuid>,
+    #[serde(default)]
     actor: String,
     reason: String,
 }
@@ -176,7 +176,7 @@ async fn create_citation(
     headers: HeaderMap,
     Json(input): Json<CreateCitation>,
 ) -> Result<StatusCode, ApiError> {
-    require_curator(&state, &headers)?;
+    let principal = require_curator(&state, &headers).await?;
     require_actor_reason(&input.actor, &input.reason)?;
     let mut tx = state.db.begin().await?;
     sqlx::query(
@@ -193,13 +193,13 @@ async fn create_citation(
     .bind(input.cited_work_id)
     .bind(input.source_document_id)
     .bind(input.evidence_span_id)
-    .bind(input.actor.trim())
+    .bind(principal.username())
     .bind(input.reason.trim())
     .execute(&mut *tx)
     .await?;
     audit(
         &mut tx,
-        &input.actor,
+        principal.username(),
         "approve",
         "citation",
         input.citing_work_id,
@@ -225,6 +225,7 @@ struct CreateArtifact {
     license_url: Option<String>,
     archived_url: Option<String>,
     sha256: Option<String>,
+    #[serde(default)]
     actor: String,
     reason: String,
 }
@@ -234,7 +235,7 @@ async fn create_artifact(
     headers: HeaderMap,
     Json(input): Json<CreateArtifact>,
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
-    require_curator(&state, &headers)?;
+    let principal = require_curator(&state, &headers).await?;
     require_actor_reason(&input.actor, &input.reason)?;
     if input.url.trim().is_empty()
         || !matches!(
@@ -273,7 +274,7 @@ async fn create_artifact(
     .await?;
     audit(
         &mut tx,
-        &input.actor,
+        principal.username(),
         "create",
         "formal_artifact",
         id,
@@ -289,6 +290,7 @@ async fn create_artifact(
 
 #[derive(Deserialize)]
 struct VerifyArtifact {
+    #[serde(default)]
     actor: String,
     notes: String,
 }
@@ -299,7 +301,7 @@ async fn verify_artifact(
     Path(id): Path<Uuid>,
     Json(input): Json<VerifyArtifact>,
 ) -> Result<StatusCode, ApiError> {
-    require_curator(&state, &headers)?;
+    let principal = require_curator(&state, &headers).await?;
     require_actor_reason(&input.actor, &input.notes)?;
     let mut tx = state.db.begin().await?;
     let updated = sqlx::query(
@@ -308,7 +310,7 @@ async fn verify_artifact(
     )
     .bind(id)
     .bind(input.notes.trim())
-    .bind(input.actor.trim())
+    .bind(principal.username())
     .execute(&mut *tx)
     .await?;
     if updated.rows_affected() == 0 {
@@ -316,7 +318,7 @@ async fn verify_artifact(
     }
     audit(
         &mut tx,
-        &input.actor,
+        principal.username(),
         "verify",
         "formal_artifact",
         id,
@@ -333,6 +335,7 @@ async fn verify_artifact(
 #[derive(Deserialize)]
 struct AssignFeatures {
     feature_slugs: Vec<String>,
+    #[serde(default)]
     actor: String,
     reason: String,
 }
@@ -343,7 +346,7 @@ async fn assign_features(
     Path(id): Path<Uuid>,
     Json(input): Json<AssignFeatures>,
 ) -> Result<StatusCode, ApiError> {
-    require_curator(&state, &headers)?;
+    let principal = require_curator(&state, &headers).await?;
     require_actor_reason(&input.actor, &input.reason)?;
     if input.feature_slugs.is_empty() {
         return Err(ApiError::BadRequest("feature_slugs is required".into()));
@@ -357,7 +360,7 @@ async fn assign_features(
         )
         .bind(id)
         .bind(slug)
-        .bind(input.actor.trim())
+        .bind(principal.username())
         .execute(&mut *tx)
         .await?;
         if inserted.rows_affected() == 0 {
@@ -374,7 +377,7 @@ async fn assign_features(
     }
     audit(
         &mut tx,
-        &input.actor,
+        principal.username(),
         "assign_features",
         "proof_result",
         id,
@@ -391,6 +394,7 @@ async fn assign_features(
 #[derive(Deserialize)]
 struct AssignTypeSystems {
     type_systems: Vec<String>,
+    #[serde(default)]
     actor: String,
     reason: String,
 }
@@ -401,7 +405,7 @@ async fn assign_type_systems(
     Path(id): Path<Uuid>,
     Json(input): Json<AssignTypeSystems>,
 ) -> Result<StatusCode, ApiError> {
-    require_curator(&state, &headers)?;
+    let principal = require_curator(&state, &headers).await?;
     require_actor_reason(&input.actor, &input.reason)?;
     if input.type_systems.is_empty() {
         return Err(ApiError::BadRequest("type_systems is required".into()));
@@ -425,13 +429,13 @@ async fn assign_type_systems(
         )
         .bind(id)
         .bind(type_system_id)
-        .bind(input.actor.trim())
+        .bind(principal.username())
         .execute(&mut *tx)
         .await?;
     }
     audit(
         &mut tx,
-        &input.actor,
+        principal.username(),
         "assign_type_systems",
         "proof_result",
         id,
@@ -453,6 +457,7 @@ struct CreateAnnotation {
     summary: String,
     evidence_source_id: Option<Uuid>,
     evidence_document_span_id: Option<Uuid>,
+    #[serde(default)]
     actor: String,
     reason: String,
 }
@@ -462,7 +467,7 @@ async fn create_annotation(
     headers: HeaderMap,
     Json(input): Json<CreateAnnotation>,
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
-    require_curator(&state, &headers)?;
+    let principal = require_curator(&state, &headers).await?;
     require_actor_reason(&input.actor, &input.reason)?;
     if input.work_id.is_some() == input.proof_result_id.is_some()
         || input.summary.trim().is_empty()
@@ -492,12 +497,12 @@ async fn create_annotation(
     .bind(input.summary.trim())
     .bind(input.evidence_source_id)
     .bind(input.evidence_document_span_id)
-    .bind(input.actor.trim())
+    .bind(principal.username())
     .fetch_one(&mut *tx)
     .await?;
     audit(
         &mut tx,
-        &input.actor,
+        principal.username(),
         "create",
         "research_annotation",
         id,
@@ -514,6 +519,7 @@ async fn create_annotation(
 #[derive(Deserialize)]
 struct SetScholarlyStatus {
     status: String,
+    #[serde(default)]
     actor: String,
     reason: String,
 }
@@ -524,7 +530,7 @@ async fn set_scholarly_status(
     Path(id): Path<Uuid>,
     Json(input): Json<SetScholarlyStatus>,
 ) -> Result<StatusCode, ApiError> {
-    require_curator(&state, &headers)?;
+    let principal = require_curator(&state, &headers).await?;
     require_actor_reason(&input.actor, &input.reason)?;
     if !matches!(
         input.status.as_str(),
@@ -545,7 +551,7 @@ async fn set_scholarly_status(
     }
     audit(
         &mut tx,
-        &input.actor,
+        principal.username(),
         "set_status",
         "work",
         id,
@@ -564,7 +570,7 @@ async fn get_work_research(
     headers: HeaderMap,
     Path(id): Path<Uuid>,
 ) -> Result<Json<Value>, ApiError> {
-    require_curator(&state, &headers)?;
+    require_curator(&state, &headers).await?;
     let work: Option<Value> = sqlx::query_scalar(
         "SELECT jsonb_build_object('id', id, 'title', title, 'doi', doi, \
          'publication_year', publication_year, 'review_status', review_status, \
@@ -668,7 +674,7 @@ async fn list_duplicate_suggestions(
     headers: HeaderMap,
     Query(page): Query<Page>,
 ) -> Result<Json<Vec<DuplicateSuggestion>>, ApiError> {
-    require_curator(&state, &headers)?;
+    require_curator(&state, &headers).await?;
     let rows = sqlx::query_as::<_, DuplicateSuggestion>(
         "SELECT id, left_work_id, right_work_id, score, method, rationale, \
          status::text AS status FROM duplicate_suggestions WHERE status = 'pending' \
@@ -685,6 +691,7 @@ async fn list_duplicate_suggestions(
 struct ResolveDuplicate {
     decision: String,
     canonical_work_id: Option<Uuid>,
+    #[serde(default)]
     actor: String,
     reason: String,
 }
@@ -695,7 +702,7 @@ async fn resolve_duplicate(
     Path(id): Path<Uuid>,
     Json(input): Json<ResolveDuplicate>,
 ) -> Result<StatusCode, ApiError> {
-    require_curator(&state, &headers)?;
+    let principal = require_curator(&state, &headers).await?;
     require_actor_reason(&input.actor, &input.reason)?;
     let mut tx = state.db.begin().await?;
     let suggestion: (Uuid, Uuid) = sqlx::query_as(
@@ -722,7 +729,7 @@ async fn resolve_duplicate(
             } else {
                 suggestion.0
             };
-            merge_work(&mut tx, duplicate, canonical, input.actor.trim()).await?;
+            merge_work(&mut tx, duplicate, canonical, principal.username()).await?;
             merged_duplicate = Some(duplicate);
             ("accepted", Some(canonical))
         }
@@ -737,7 +744,7 @@ async fn resolve_duplicate(
     .bind(id)
     .bind(status)
     .bind(canonical)
-    .bind(input.actor.trim())
+    .bind(principal.username())
     .bind(input.reason.trim())
     .execute(&mut *tx)
     .await?;
@@ -753,13 +760,13 @@ async fn resolve_duplicate(
         )
         .bind(id)
         .bind(duplicate)
-        .bind(input.actor.trim())
+        .bind(principal.username())
         .execute(&mut *tx)
         .await?;
     }
     audit(
         &mut tx,
-        &input.actor,
+        principal.username(),
         "resolve",
         "duplicate_suggestion",
         id,
@@ -1020,9 +1027,9 @@ async fn audit(
     Ok(())
 }
 
-fn require_actor_reason(actor: &str, reason: &str) -> Result<(), ApiError> {
-    if actor.trim().is_empty() || reason.trim().is_empty() {
-        return Err(ApiError::BadRequest("actor and reason are required".into()));
+fn require_actor_reason(_actor: &str, reason: &str) -> Result<(), ApiError> {
+    if reason.trim().is_empty() {
+        return Err(ApiError::BadRequest("reason is required".into()));
     }
     Ok(())
 }

@@ -12,6 +12,17 @@ Python claims durable jobs from PostgreSQL and emits derived candidates. It
 does not access hosted inference services and must never promote a candidate to
 a canonical scholarly assertion.
 
+## Authentication and audit identity
+
+The deployment bootstrap secret authenticates an emergency administrator that
+can create named `viewer`, `curator`, and `admin` accounts. Named API tokens are
+random, stored only as SHA-256 digests, and can expire or be revoked without a
+restart. Each protected request resolves the current account from PostgreSQL;
+curation requires the `curator` or `admin` role and account administration
+requires `admin`. Audit attribution, review ownership, export requesters and ML
+label ownership are derived from that authenticated principal. Client-supplied
+identity fields are never trusted.
+
 ## Data ownership
 
 PostgreSQL is canonical for metadata and curation. `/data/objects` is intended
@@ -37,6 +48,14 @@ parent traversal are rejected in both services.
 Workers claim jobs with `FOR UPDATE SKIP LOCKED`. Leases allow work to be
 recovered following a container crash. Idempotency keys prevent duplicate work.
 Failures use bounded retries and eventually enter `dead_letter`.
+
+## Metrics history
+
+PostgreSQL statement triggers capture corpus and queue counts into one
+upserted snapshot per minute whenever relevant records change. These snapshots
+preserve backlog history without storing source text and let the dashboard show
+both cumulative research output and the changing amount of work awaiting human
+review. The mechanism is database-local and does not require a telemetry SaaS.
 
 ## Scaling boundary
 

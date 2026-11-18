@@ -96,6 +96,7 @@ jobs:
           for attempt in $(seq 1 60); do
             if curl --fail --silent http://localhost:8081/health/ready; then
               python3 scripts/e2e.py
+              target/debug/type-safety-history-api verify-storage
               exit 0
             fi
             sleep 1

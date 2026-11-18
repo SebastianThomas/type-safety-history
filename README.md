@@ -22,6 +22,28 @@ curl http://localhost:8080/health/ready
 The API is exposed on port `8080`; PostgreSQL is exposed on `5451`. Persistent
 application data lives in the `app-data` volume mounted at `/data`.
 
+`CURATOR_TOKEN` is the bootstrap administrator secret. Use it to create named
+curator accounts and revocable API tokens, then reserve it for recovery:
+
+```bash
+curl -X POST http://localhost:8080/api/v1/admin/users \
+  -H "Authorization: Bearer $CURATOR_TOKEN" \
+  -H 'Content-Type: application/json' \
+  --data '{"username":"alice","display_name":"Alice Curator","role":"curator"}'
+
+curl -X POST http://localhost:8080/api/v1/admin/users/<user-id>/tokens \
+  -H "Authorization: Bearer $CURATOR_TOKEN" \
+  -H 'Content-Type: application/json' \
+  --data '{"label":"workstation","expires_at":null}'
+```
+
+The generated token is shown once and stored only as a SHA-256 digest. Accounts
+have `viewer`, `curator`, or `admin` roles and can be deactivated; individual
+tokens can expire or be revoked immediately. `GET /api/v1/auth/me` identifies
+the current principal. Audit identity is always taken from that authenticated
+principal. Legacy `actor`, `labelled_by`, and `requested_by` request fields are
+accepted for compatibility but ignored.
+
 For host-side checks:
 
 ```bash
@@ -66,6 +88,16 @@ docker compose run --rm api seed /app/fixtures/seed-works.json
 
 The loader is idempotent and creates discovery candidates rather than silently
 promoting seed records into canonical scholarship.
+
+After a backup restore, verify database-to-volume consistency with:
+
+```bash
+docker compose run --rm api verify-storage
+```
+
+This checks every active source object and successful Parquet export against its
+SHA-256 digest, confirms Zarr directories exist, and verifies that taken-down
+objects have not reappeared.
 
 ## Research and historical curation
 
@@ -149,8 +181,9 @@ The same data is available as JSON:
 - `GET /api/v1/stats/overview`
 - `GET /api/v1/stats/evolution?days=365`
 
-Evolution values are cumulative event counts; the overview is authoritative
-for current backlogs and review statuses.
+Evolution includes cumulative discovery/research events and durable
+minute-bucketed snapshots of pending discovery, proof-review and worker queues.
+The overview remains authoritative for the current instant.
 
 ## Lifecycle operations
 
