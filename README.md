@@ -67,8 +67,12 @@ kubectl apply -k db
 kubectl apply -k deploy
 ```
 
-Set the real image names and public hostname before deployment. See
-[`docs/operations.md`](docs/operations.md).
+Production releases use Git tags. A successful `vMAJOR.MINOR.PATCH` build
+publishes the API and ML image variants to the single
+`sthomasch/type-safety-history` Docker Hub repository, then deploys that exact
+version pair to the protected `production` GitHub environment through
+Headscale. See [`docs/operations.md`](docs/operations.md) for the required
+repository/environment settings and the manual recovery path.
 
 ## Crossref DOI import
 

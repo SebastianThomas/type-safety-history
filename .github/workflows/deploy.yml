@@ -1,0 +1,116 @@
+name: deploy
+run-name: "deploy production @ ${{ inputs.tag || github.event.workflow_run.head_branch }}"
+
+on:
+  workflow_run:
+    workflows: [build]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Published tag to deploy, for example v1.0.0
+        required: true
+        type: string
+
+concurrency:
+  group: type-safety-history-production
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    outputs:
+      proceed: ${{ steps.gate.outputs.proceed }}
+      tag: ${{ steps.gate.outputs.tag }}
+    steps:
+      - id: gate
+        env:
+          EVENT: ${{ github.event_name }}
+          INPUT_TAG: ${{ inputs.tag }}
+          RUN_CONCLUSION: ${{ github.event.workflow_run.conclusion }}
+          RUN_REF: ${{ github.event.workflow_run.head_branch }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT" = workflow_dispatch ]; then
+            tag="$INPUT_TAG"
+          elif [ "$RUN_CONCLUSION" = success ] && [[ "$RUN_REF" == v* ]]; then
+            tag="$RUN_REF"
+          else
+            echo "proceed=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::Only successful v* release builds deploy automatically."
+            exit 0
+          fi
+          if [[ ! "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "Invalid release tag: $tag" >&2
+            exit 1
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "proceed=true" >> "$GITHUB_OUTPUT"
+
+  deploy:
+    needs: gate
+    if: needs.gate.outputs.proceed == 'true'
+    runs-on: ubuntu-latest
+    environment:
+      name: production
+      url: https://type-safety-history.sthomas.ch
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.gate.outputs.tag }}
+
+      - name: Join the homelab network
+        uses: SebastianThomas/homelab-actions/headscale-connect@v1
+        with:
+          auth-key: ${{ secrets.TS_AUTHKEY }}
+          login-server: ${{ secrets.HEADSCALE_URL }}
+          ping: kube-cp-01
+          hostname: gha-type-safety-history-${{ github.run_id }}-${{ github.run_attempt }}
+
+      - name: Reconcile CNPG database
+        uses: SebastianThomas/homelab-actions/cnpg-cluster@v1
+        with:
+          server: ${{ secrets.KUBE_API }}
+          ca: ${{ secrets.KUBE_CA }}
+          token: ${{ secrets.KUBE_TOKEN }}
+          namespace: type-safety-history
+          manifests: db
+          timeout: 900s
+
+      - name: Reconcile application configuration
+        uses: SebastianThomas/homelab-actions/kube-secret@v1
+        with:
+          server: ${{ secrets.KUBE_API }}
+          ca: ${{ secrets.KUBE_CA }}
+          token: ${{ secrets.KUBE_TOKEN }}
+          namespace: type-safety-history
+          name: type-safety-history-config
+          literals: |
+            curator-token=${{ secrets.CURATOR_TOKEN }}
+            crossref-mailto=${{ vars.CROSSREF_MAILTO }}
+            openalex-api-key=${{ secrets.OPENALEX_API_KEY }}
+
+      - name: Deploy application
+        uses: SebastianThomas/homelab-actions/kube-deploy@v1
+        with:
+          server: ${{ secrets.KUBE_API }}
+          ca: ${{ secrets.KUBE_CA }}
+          token: ${{ secrets.KUBE_TOKEN }}
+          namespace: type-safety-history
+          manifests: deploy
+          images: |
+            API_IMAGE=${{ vars.DOCKERHUB_REPOSITORY }}:${{ needs.gate.outputs.tag }}-api
+            ML_IMAGE=${{ vars.DOCKERHUB_REPOSITORY }}:${{ needs.gate.outputs.tag }}-ml
+          rollouts: deployment/type-safety-history
+          rollout-timeout: 600s
+
+      - name: Seed research queue and verify storage
+        run: |
+          set -euo pipefail
+          kubectl -n type-safety-history exec deployment/type-safety-history -c api -- \
+            api seed /app/fixtures/seed-works.json
+          kubectl -n type-safety-history exec deployment/type-safety-history -c api -- \
+            api verify-storage

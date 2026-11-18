@@ -2,14 +2,57 @@
 
 ## Before first deployment
 
-1. Replace both `example.invalid` image references in `deploy/deployment.yaml`.
-2. Replace the example hostname in `deploy/httproute.yaml` or remove the route.
-3. Confirm the CNPG image catalog name and PostgreSQL major version available
-   in the target cluster.
-4. Label/select a node suitable for local-path persistence if the cluster has
+1. Confirm `type-safety-history.sthomas.ch` resolves to the homelab ingress.
+2. Confirm the homelab `postgresql-minimal-trixie` CNPG image catalog exposes
+   PostgreSQL major version 18.
+3. Label/select a node suitable for local-path persistence if the cluster has
    multiple nodes.
-5. Establish backups to storage physically separate from both local PVCs.
-6. Create the application bootstrap configuration Secret before starting the Deployment:
+4. Establish backups to storage physically separate from both local PVCs.
+5. Configure the GitHub Actions settings listed below.
+
+Tagged releases are the production path. A tag matching `vMAJOR.MINOR.PATCH`
+(with an optional prerelease suffix) runs the complete Rust, Python, E2E,
+manifest, container and supply-chain suite before publishing these tags to the
+single Docker Hub repository:
+
+- `vMAJOR.MINOR.PATCH-api` and `latest-api`
+- `vMAJOR.MINOR.PATCH-ml` and `latest-ml`
+
+After a successful tagged build, `.github/workflows/deploy.yml` joins the
+homelab through Headscale, reconciles CNPG and the application Secret, deploys
+the immutable versioned image pair, waits for rollout, seeds the research queue
+and verifies database-to-volume integrity. The workflow can also redeploy a
+previously published tag manually. Configure the `production` GitHub
+environment with deployment protection/required reviewers as appropriate.
+The repository's `production` environment currently has a five-minute wait
+timer so a tagged release cannot deploy instantaneously.
+
+Repository Actions configuration:
+
+- Secret `DOCKERHUB_TOKEN`: Docker Hub personal access token with write access
+  to `sthomasch/type-safety-history`.
+- Variable `DOCKERHUB_USERNAME`: `sthomasch`.
+- Variable `DOCKERHUB_REPOSITORY`: `sthomasch/type-safety-history`.
+
+`production` environment secrets:
+
+- `TS_AUTHKEY`: reusable or ephemeral Headscale pre-authentication key for the
+  Actions runner.
+- `HEADSCALE_URL`: Headscale control-server URL.
+- `KUBE_API`: homelab Kubernetes API URL reachable after joining Headscale.
+- `KUBE_CA`: base64-encoded cluster CA expected by `homelab-actions`.
+- `KUBE_TOKEN`: least-privilege service-account bearer token for the
+  `type-safety-history` namespace plus the CNPG resources it reconciles.
+- `CURATOR_TOKEN`: long random bootstrap administrator token.
+- `OPENALEX_API_KEY`: optional; omit or leave empty to disable OpenAlex.
+
+`production` environment variable:
+
+- `CROSSREF_MAILTO`: monitored research contact email used for Crossref's
+  polite pool.
+
+For an emergency manual deployment, create the application configuration
+Secret before starting the Deployment:
 
    ```bash
    kubectl -n type-safety-history create secret generic type-safety-history-config \
@@ -19,7 +62,8 @@
    ```
 
 Apply `db/` first and wait for the CNPG cluster to become ready. Then apply
-`deploy/`. Both Kustomizations include the same idempotent Namespace definition.
+`deploy/` after replacing `${API_IMAGE}` and `${ML_IMAGE}` with published image
+references. Both Kustomizations include the same idempotent Namespace definition.
 The API runs migrations before it becomes ready; the worker waits for
 the schema and claims work afterward.
 

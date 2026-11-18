@@ -52,7 +52,7 @@ spec:
           emptyDir: { sizeLimit: 256Mi }
       containers:
         - name: api
-          image: example.invalid/type-safety-history-api:latest
+          image: ${API_IMAGE}
           imagePullPolicy: IfNotPresent
           ports:
             - { name: http, containerPort: 8080 }
@@ -94,7 +94,7 @@ spec:
             runAsNonRoot: true
             runAsUser: 10001
         - name: ml-worker
-          image: example.invalid/type-safety-history-ml:latest
+          image: ${ML_IMAGE}
           imagePullPolicy: IfNotPresent
           env:
             - { name: DATA_ROOT, value: /data }

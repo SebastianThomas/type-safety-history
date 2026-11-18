@@ -25,7 +25,8 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
-        with: { components: rustfmt, clippy }
+        with:
+          components: rustfmt,clippy
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
@@ -39,7 +40,7 @@ jobs:
           cargo run -p type-safety-history-api > /tmp/type-safety-history-api.log 2>&1 &
           api_pid=$!
           trap 'kill "$api_pid" || true' EXIT
-          for attempt in $(seq 1 60); do
+          for _ in $(seq 1 60); do
             if curl --fail --silent http://localhost:8081/health/ready; then
               exit 0
             fi
@@ -96,7 +97,7 @@ jobs:
           WORKER_ID=ci-worker-2 uv run --project ml type-safety-ml-worker > /tmp/type-safety-history-worker-2.log 2>&1 &
           worker_2_pid=$!
           trap 'kill "$api_pid" "$worker_1_pid" "$worker_2_pid" || true' EXIT
-          for attempt in $(seq 1 60); do
+          for _ in $(seq 1 60); do
             if curl --fail --silent http://localhost:8081/health/ready; then
               python3 scripts/e2e.py
               target/debug/type-safety-history-api verify-storage
@@ -148,3 +149,95 @@ jobs:
           format: spdx-json
           output-file: type-safety-history.spdx.json
           upload-artifact: true
+
+  release-metadata:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [rust, python, end-to-end, manifests, containers, supply-chain]
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.release.outputs.tag }}
+      prerelease: ${{ steps.release.outputs.prerelease }}
+    steps:
+      - id: release
+        name: Validate release tag
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "Release tags must use vMAJOR.MINOR.PATCH with an optional prerelease suffix." >&2
+            exit 1
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          if [[ "$TAG" == *-* ]]; then
+            echo "prerelease=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "prerelease=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  publish:
+    needs: release-metadata
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - component: api
+            dockerfile: containers/api.Dockerfile
+          - component: ml
+            dockerfile: containers/ml.Dockerfile
+    steps:
+      - uses: actions/checkout@v6
+      - name: Sign in to Docker Hub
+        uses: docker/login-action@v4
+        with:
+          username: ${{ vars.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      - uses: docker/setup-buildx-action@v4
+      - name: Build and publish ${{ matrix.component }} image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: ${{ matrix.dockerfile }}
+          platforms: linux/amd64
+          push: true
+          tags: |
+            ${{ vars.DOCKERHUB_REPOSITORY }}:${{ needs.release-metadata.outputs.tag }}-${{ matrix.component }}
+            ${{ vars.DOCKERHUB_REPOSITORY }}:latest-${{ matrix.component }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ needs.release-metadata.outputs.tag }}
+            org.opencontainers.image.title=type-safety-history-${{ matrix.component }}
+          cache-from: type=gha,scope=${{ matrix.component }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.component }}
+          provenance: mode=max
+          sbom: true
+
+  github-release:
+    needs: [release-metadata, publish]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.release-metadata.outputs.tag }}
+          PRERELEASE: ${{ needs.release-metadata.outputs.prerelease }}
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "GitHub release $TAG already exists; leaving it unchanged."
+            exit 0
+          fi
+          args=("$TAG" --title "$TAG" --generate-notes)
+          if [ "$PRERELEASE" = true ]; then
+            args+=(--prerelease)
+          fi
+          gh release create "${args[@]}"

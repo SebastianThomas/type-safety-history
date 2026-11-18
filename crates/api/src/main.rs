@@ -89,7 +89,7 @@ async fn main() -> Result<()> {
         Ok(mailto) if !mailto.trim().is_empty() => Some(crossref::CrossrefClient::new(
             mailto,
             env::var("CROSSREF_USER_AGENT").unwrap_or_else(|_| {
-                "type-safety-history/0.1 (+https://example.invalid/type-safety-history)".into()
+                "type-safety-history/0.1 (+https://type-safety-history.sthomas.ch)".into()
             }),
         )?),
         _ => None,
@@ -98,7 +98,7 @@ async fn main() -> Result<()> {
         Ok(api_key) if !api_key.trim().is_empty() => Some(openalex::OpenAlexClient::new(
             api_key,
             env::var("OPENALEX_USER_AGENT").unwrap_or_else(|_| {
-                "type-safety-history/0.1 (+https://example.invalid/type-safety-history)".into()
+                "type-safety-history/0.1 (+https://type-safety-history.sthomas.ch)".into()
             }),
         )?),
         _ => None,

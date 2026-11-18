@@ -7,7 +7,7 @@ spec:
     - name: traefik-gateway
       namespace: kube-system
   hostnames:
-    - type-safety-history.example.invalid
+    - type-safety-history.sthomas.ch
   rules:
     - backendRefs:
         - name: type-safety-history
