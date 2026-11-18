@@ -26,8 +26,10 @@ sites are never sufficient evidence by themselves.
 - `link_only` and `prohibited` content cannot be registered as a local document.
 - ML processing requires an explicit `ml_use_permitted` decision.
 - Public exports must omit restricted documents and substantial source text.
-- A takedown records the audit event and removes the governed local object and
-  derived content while preserving lawful bibliographic metadata.
+- A takedown records the audit event, tombstones the database record, disables
+  further ML/redistribution and removes the governed local object and derived
+  content. Evidence hashes, coordinates and paraphrases remain for provenance;
+  extracted source text does not.
 
 Every adapter must document its allowed endpoints, fields, rate limits,
 retention, redistribution rules and terms URL before it is enabled.

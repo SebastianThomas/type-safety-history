@@ -58,6 +58,14 @@ curl -X POST http://localhost:8080/api/v1/imports/crossref \
 ```
 
 The initial DOI queue is in [`fixtures/seed-works.json`](fixtures/seed-works.json).
+Load or refresh it without network access after the database is available:
+
+```bash
+docker compose run --rm api seed /app/fixtures/seed-works.json
+```
+
+The loader is idempotent and creates discovery candidates rather than silently
+promoting seed records into canonical scholarship.
 
 ## Research and historical curation
 
@@ -128,6 +136,33 @@ Creating works automatically queues duplicate detection; Crossref discovery
 automatically queues entity resolution. Manual reruns are available through
 `POST /api/v1/ml/jobs/entity-resolution` and
 `POST /api/v1/ml/jobs/duplicate-detection`.
+
+## Corpus dashboard
+
+Open `http://localhost:8080/dashboard` for a read-only view of current corpus
+state. It shows the discovery funnel, canonical works, machine candidates,
+approved proofs, review queues, queue health and cumulative growth during the
+last year. The page refreshes every minute and does not expose source text.
+
+The same data is available as JSON:
+
+- `GET /api/v1/stats/overview`
+- `GET /api/v1/stats/evolution?days=365`
+
+Evolution values are cumulative event counts; the overview is authoritative
+for current backlogs and review statuses.
+
+## Lifecycle operations
+
+`POST /api/v1/documents/{id}/takedown` performs an authenticated, audited and
+idempotent takedown. It tombstones the document record, disables processing and
+redistribution, rejects pending machine candidates, stops extraction jobs and
+removes source/derived objects while retaining provenance.
+
+Accepting a duplicate suggestion now performs a transactional consolidation:
+dependent documents, proofs, versions, authors, sources, citations, relations,
+annotations and artifacts move to the selected canonical work. The duplicate
+work remains as an audited redirect tombstone.
 
 ## Timeline and exports
 

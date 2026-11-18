@@ -697,19 +697,38 @@ async fn resolve_duplicate(
 ) -> Result<StatusCode, ApiError> {
     require_curator(&state, &headers)?;
     require_actor_reason(&input.actor, &input.reason)?;
+    let mut tx = state.db.begin().await?;
+    let suggestion: (Uuid, Uuid) = sqlx::query_as(
+        "SELECT left_work_id, right_work_id FROM duplicate_suggestions \
+         WHERE id = $1 AND status = 'pending' FOR UPDATE",
+    )
+    .bind(id)
+    .fetch_optional(&mut *tx)
+    .await?
+    .ok_or(ApiError::NotFound)?;
+    let mut merged_duplicate = None;
     let (status, canonical) = match input.decision.as_str() {
-        "accept" => (
-            "accepted",
-            Some(
-                input
-                    .canonical_work_id
-                    .ok_or_else(|| ApiError::BadRequest("canonical_work_id is required".into()))?,
-            ),
-        ),
+        "accept" => {
+            let canonical = input
+                .canonical_work_id
+                .ok_or_else(|| ApiError::BadRequest("canonical_work_id is required".into()))?;
+            if canonical != suggestion.0 && canonical != suggestion.1 {
+                return Err(ApiError::BadRequest(
+                    "canonical_work_id must be one of the suggested works".into(),
+                ));
+            }
+            let duplicate = if canonical == suggestion.0 {
+                suggestion.1
+            } else {
+                suggestion.0
+            };
+            merge_work(&mut tx, duplicate, canonical, input.actor.trim()).await?;
+            merged_duplicate = Some(duplicate);
+            ("accepted", Some(canonical))
+        }
         "reject" => ("rejected", None),
         _ => return Err(ApiError::BadRequest("invalid decision".into())),
     };
-    let mut tx = state.db.begin().await?;
     let updated = sqlx::query(
         "UPDATE duplicate_suggestions SET status = $2::resolution_status, \
          canonical_work_id = $3, resolved_by = $4, resolution_reason = $5, resolved_at = now() \
@@ -725,6 +744,19 @@ async fn resolve_duplicate(
     if updated.rows_affected() == 0 {
         return Err(ApiError::NotFound);
     }
+    if let Some(duplicate) = merged_duplicate {
+        sqlx::query(
+            "UPDATE duplicate_suggestions SET status = 'rejected', resolved_by = $3, \
+             resolution_reason = 'Superseded because one work was merged', resolved_at = now() \
+             WHERE id <> $1 AND status = 'pending' \
+             AND (left_work_id = $2 OR right_work_id = $2)",
+        )
+        .bind(id)
+        .bind(duplicate)
+        .bind(input.actor.trim())
+        .execute(&mut *tx)
+        .await?;
+    }
     audit(
         &mut tx,
         &input.actor,
@@ -739,6 +771,220 @@ async fn resolve_duplicate(
     .await?;
     tx.commit().await?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+async fn merge_work(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    duplicate: Uuid,
+    canonical: Uuid,
+    actor: &str,
+) -> Result<(), ApiError> {
+    let available: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM works WHERE id = $1 AND merged_into_work_id IS NULL)",
+    )
+    .bind(canonical)
+    .fetch_one(&mut **tx)
+    .await?;
+    if !available {
+        return Err(ApiError::BadRequest(
+            "canonical work is already merged".into(),
+        ));
+    }
+
+    sqlx::query(
+        "DELETE FROM work_versions d USING work_versions c \
+         WHERE d.work_id = $1 AND c.work_id = $2 AND d.version_label = c.version_label",
+    )
+    .bind(duplicate)
+    .bind(canonical)
+    .execute(&mut **tx)
+    .await?;
+    let canonical_has_version: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM work_versions WHERE work_id = $1 AND is_canonical)",
+    )
+    .bind(canonical)
+    .fetch_one(&mut **tx)
+    .await?;
+    if canonical_has_version {
+        sqlx::query("UPDATE work_versions SET is_canonical = false WHERE work_id = $1")
+            .bind(duplicate)
+            .execute(&mut **tx)
+            .await?;
+    }
+    sqlx::query("UPDATE work_versions SET work_id = $2 WHERE work_id = $1")
+        .bind(duplicate)
+        .bind(canonical)
+        .execute(&mut **tx)
+        .await?;
+
+    sqlx::query(
+        "WITH missing AS ( \
+            SELECT wa.person_id, row_number() OVER (ORDER BY wa.position, wa.person_id) AS offset \
+            FROM work_authors wa WHERE wa.work_id = $1 \
+            AND NOT EXISTS (SELECT 1 FROM work_authors c \
+                            WHERE c.work_id = $2 AND c.person_id = wa.person_id) \
+         ), base AS (SELECT COALESCE(max(position), -1) AS position FROM work_authors WHERE work_id = $2) \
+         INSERT INTO work_authors (work_id, person_id, position) \
+         SELECT $2, missing.person_id, base.position + missing.offset::integer \
+         FROM missing CROSS JOIN base",
+    )
+    .bind(duplicate)
+    .bind(canonical)
+    .execute(&mut **tx)
+    .await?;
+    sqlx::query("DELETE FROM work_authors WHERE work_id = $1")
+        .bind(duplicate)
+        .execute(&mut **tx)
+        .await?;
+
+    let sources: Vec<(Uuid, String)> =
+        sqlx::query_as("SELECT id, url FROM sources WHERE work_id = $1")
+            .bind(duplicate)
+            .fetch_all(&mut **tx)
+            .await?;
+    for (source_id, url) in sources {
+        let existing: Option<Uuid> =
+            sqlx::query_scalar("SELECT id FROM sources WHERE work_id = $1 AND url = $2")
+                .bind(canonical)
+                .bind(&url)
+                .fetch_optional(&mut **tx)
+                .await?;
+        if let Some(existing_id) = existing {
+            sqlx::query("UPDATE documents SET source_id = $2 WHERE source_id = $1")
+                .bind(source_id)
+                .bind(existing_id)
+                .execute(&mut **tx)
+                .await?;
+            sqlx::query(
+                "UPDATE work_relations SET evidence_source_id = $2 WHERE evidence_source_id = $1",
+            )
+            .bind(source_id)
+            .bind(existing_id)
+            .execute(&mut **tx)
+            .await?;
+            sqlx::query("UPDATE research_annotations SET evidence_source_id = $2 WHERE evidence_source_id = $1")
+                .bind(source_id)
+                .bind(existing_id)
+                .execute(&mut **tx)
+                .await?;
+            sqlx::query("DELETE FROM sources WHERE id = $1")
+                .bind(source_id)
+                .execute(&mut **tx)
+                .await?;
+        } else {
+            sqlx::query("UPDATE sources SET work_id = $2 WHERE id = $1")
+                .bind(source_id)
+                .bind(canonical)
+                .execute(&mut **tx)
+                .await?;
+        }
+    }
+
+    sqlx::query("UPDATE documents SET work_id = $2 WHERE work_id = $1")
+        .bind(duplicate)
+        .bind(canonical)
+        .execute(&mut **tx)
+        .await?;
+    sqlx::query("UPDATE proof_results SET work_id = $2 WHERE work_id = $1")
+        .bind(duplicate)
+        .bind(canonical)
+        .execute(&mut **tx)
+        .await?;
+    sqlx::query("UPDATE research_annotations SET work_id = $2 WHERE work_id = $1")
+        .bind(duplicate)
+        .bind(canonical)
+        .execute(&mut **tx)
+        .await?;
+    sqlx::query("UPDATE discovery_candidates SET work_id = $2 WHERE work_id = $1")
+        .bind(duplicate)
+        .bind(canonical)
+        .execute(&mut **tx)
+        .await?;
+    sqlx::query("UPDATE citation_candidates SET citing_work_id = $2 WHERE citing_work_id = $1")
+        .bind(duplicate)
+        .bind(canonical)
+        .execute(&mut **tx)
+        .await?;
+    sqlx::query(
+        "DELETE FROM entity_resolution_suggestions d USING entity_resolution_suggestions c \
+         WHERE d.work_id = $1 AND c.work_id = $2 \
+         AND d.discovery_candidate_id = c.discovery_candidate_id AND d.method = c.method",
+    )
+    .bind(duplicate)
+    .bind(canonical)
+    .execute(&mut **tx)
+    .await?;
+    sqlx::query("UPDATE entity_resolution_suggestions SET work_id = $2 WHERE work_id = $1")
+        .bind(duplicate)
+        .bind(canonical)
+        .execute(&mut **tx)
+        .await?;
+
+    sqlx::query(
+        "DELETE FROM formal_artifacts d USING formal_artifacts c \
+         WHERE d.work_id = $1 AND c.work_id = $2 AND d.url = c.url",
+    )
+    .bind(duplicate)
+    .bind(canonical)
+    .execute(&mut **tx)
+    .await?;
+    sqlx::query("UPDATE formal_artifacts SET work_id = $2 WHERE work_id = $1")
+        .bind(duplicate)
+        .bind(canonical)
+        .execute(&mut **tx)
+        .await?;
+
+    sqlx::query(
+        "INSERT INTO citations \
+            (citing_work_id, cited_work_id, source_document_id, status, evidence_span_id, \
+             created_by, review_reason) \
+         SELECT CASE WHEN citing_work_id = $1 THEN $2 ELSE citing_work_id END, \
+                CASE WHEN cited_work_id = $1 THEN $2 ELSE cited_work_id END, \
+                source_document_id, status, evidence_span_id, created_by, review_reason \
+         FROM citations WHERE (citing_work_id = $1 OR cited_work_id = $1) \
+         AND CASE WHEN citing_work_id = $1 THEN $2 ELSE citing_work_id END <> \
+             CASE WHEN cited_work_id = $1 THEN $2 ELSE cited_work_id END \
+         ON CONFLICT (citing_work_id, cited_work_id) DO NOTHING",
+    )
+    .bind(duplicate)
+    .bind(canonical)
+    .execute(&mut **tx)
+    .await?;
+    sqlx::query("DELETE FROM citations WHERE citing_work_id = $1 OR cited_work_id = $1")
+        .bind(duplicate)
+        .execute(&mut **tx)
+        .await?;
+
+    sqlx::query(
+        "INSERT INTO work_relations \
+            (from_work_id, to_work_id, relation_kind, evidence_source_id, notes, status, created_by) \
+         SELECT CASE WHEN from_work_id = $1 THEN $2 ELSE from_work_id END, \
+                CASE WHEN to_work_id = $1 THEN $2 ELSE to_work_id END, \
+                relation_kind, evidence_source_id, notes, status, created_by \
+         FROM work_relations WHERE (from_work_id = $1 OR to_work_id = $1) \
+         AND CASE WHEN from_work_id = $1 THEN $2 ELSE from_work_id END <> \
+             CASE WHEN to_work_id = $1 THEN $2 ELSE to_work_id END \
+         ON CONFLICT (from_work_id, to_work_id, relation_kind) DO NOTHING",
+    )
+    .bind(duplicate)
+    .bind(canonical)
+    .execute(&mut **tx)
+    .await?;
+    sqlx::query("DELETE FROM work_relations WHERE from_work_id = $1 OR to_work_id = $1")
+        .bind(duplicate)
+        .execute(&mut **tx)
+        .await?;
+
+    sqlx::query(
+        "UPDATE works SET merged_into_work_id = $2, merged_at = now(), merged_by = $3 \
+         WHERE id = $1 AND merged_into_work_id IS NULL",
+    )
+    .bind(duplicate)
+    .bind(canonical)
+    .bind(actor)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
 }
 
 async fn json_rows(state: &AppState, query: &str, id: Uuid) -> Result<Value, ApiError> {

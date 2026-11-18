@@ -56,7 +56,53 @@ jobs:
         with: { enable-cache: true }
       - run: uv sync --project ml --all-groups
       - run: uv run --project ml ruff check ml
+      - run: uv run --project ml ruff check scripts
       - run: uv run --project ml pytest
+
+  end-to-end:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:18-bookworm
+        env:
+          POSTGRES_DB: type_safety_history
+          POSTGRES_USER: type_safety_history
+          POSTGRES_PASSWORD: type_safety_history
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U type_safety_history"
+          --health-interval 5s --health-timeout 3s --health-retries 20
+    env:
+      DATABASE_URL: postgresql://type_safety_history:type_safety_history@localhost:5432/type_safety_history
+      DATA_ROOT: /tmp/type-safety-history-e2e-data
+      CURATOR_TOKEN: ci-only-token
+      PORT: "8081"
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: astral-sh/setup-uv@v7
+        with: { enable-cache: true }
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --workspace
+      - run: uv sync --project ml --all-groups
+      - run: target/debug/type-safety-history-api seed fixtures/seed-works.json
+      - name: Exercise API, worker, lifecycle, and dashboard
+        run: |
+          target/debug/type-safety-history-api > /tmp/type-safety-history-api.log 2>&1 &
+          api_pid=$!
+          uv run --project ml type-safety-ml-worker > /tmp/type-safety-history-worker.log 2>&1 &
+          worker_pid=$!
+          trap 'kill "$api_pid" "$worker_pid" || true' EXIT
+          for attempt in $(seq 1 60); do
+            if curl --fail --silent http://localhost:8081/health/ready; then
+              python3 scripts/e2e.py
+              exit 0
+            fi
+            sleep 1
+          done
+          cat /tmp/type-safety-history-api.log
+          cat /tmp/type-safety-history-worker.log
+          exit 1
 
   manifests:
     runs-on: ubuntu-latest
@@ -72,3 +118,26 @@ jobs:
       - uses: actions/checkout@v6
       - run: docker build -f containers/api.Dockerfile -t type-safety-history-api:test .
       - run: docker build -f containers/ml.Dockerfile -t type-safety-history-ml:test .
+
+  supply-chain:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v6
+      - name: Vulnerability, secret, licence, and configuration scan
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          scanners: vuln,secret,misconfig,license
+          severity: HIGH,CRITICAL
+          exit-code: "1"
+          ignore-unfixed: true
+      - name: Generate SPDX SBOM
+        uses: anchore/sbom-action@v0.24.3
+        with:
+          path: .
+          format: spdx-json
+          output-file: type-safety-history.spdx.json
+          upload-artifact: true

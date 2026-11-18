@@ -7,6 +7,8 @@ RUN cargo build --release --locked
 
 FROM debian:bookworm-slim
 COPY --from=build /src/target/release/type-safety-history-api /usr/local/bin/api
+COPY fixtures /app/fixtures
+WORKDIR /app
 USER 10001
 EXPOSE 8080
 ENTRYPOINT ["/usr/local/bin/api"]

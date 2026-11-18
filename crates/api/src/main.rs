@@ -1,7 +1,10 @@
 mod crossref;
+mod lifecycle;
 mod ml;
 mod research;
 mod routes;
+mod seed;
+mod stats;
 
 use std::{
     env,
@@ -28,8 +31,22 @@ pub(crate) struct AppState {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    if env::args().nth(1).as_deref() == Some("healthcheck") {
-        return healthcheck().await;
+    let mut arguments = env::args().skip(1);
+    match arguments.next().as_deref() {
+        Some("healthcheck") => return healthcheck().await,
+        Some("seed") => {
+            init_tracing();
+            let path = arguments
+                .next()
+                .context("usage: api seed <seed-file.json>")?;
+            anyhow::ensure!(
+                arguments.next().is_none(),
+                "usage: api seed <seed-file.json>"
+            );
+            return seed::run(Path::new(&path)).await;
+        }
+        Some(command) => anyhow::bail!("unknown command: {command}"),
+        None => {}
     }
     init_tracing();
 

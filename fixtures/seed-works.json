@@ -1,11 +1,17 @@
 [
   {
     "doi": "10.1016/0022-0000(78)90014-4",
+    "title": "A Theory of Type Polymorphism in Programming",
+    "publication_year": 1978,
+    "work_type": "article",
     "role": "historical_precursor",
     "curation_note": "Candidate anchor for semantic type soundness; theorem claims require page-level primary-source review."
   },
   {
     "doi": "10.1006/inco.1994.1093",
+    "title": "A Syntactic Approach to Type Soundness",
+    "publication_year": 1994,
+    "work_type": "article",
     "role": "syntactic_approach_anchor",
     "curation_note": "Canonical modern anchor for the syntactic approach; do not convert this into an unqualified priority claim."
   }

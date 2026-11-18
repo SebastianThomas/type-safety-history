@@ -304,7 +304,8 @@ def persist_success(
 ) -> None:
     with connection.transaction(), connection.cursor(row_factory=dict_row) as cursor:
         cursor.execute(
-            "SELECT work_id FROM documents WHERE id = %s AND ml_use_permitted = true",
+            "SELECT work_id FROM documents WHERE id = %s AND ml_use_permitted = true "
+            "AND status = 'active'",
             (document_id,),
         )
         document = cursor.fetchone()
@@ -636,7 +637,9 @@ def resolve_discovery_entities(connection: psycopg.Connection[Any]) -> dict[str,
             "SELECT id, title, publication_year FROM discovery_candidates WHERE status = 'pending'"
         )
         candidates = cursor.fetchall()
-        cursor.execute("SELECT id, title, publication_year FROM works")
+        cursor.execute(
+            "SELECT id, title, publication_year FROM works WHERE merged_into_work_id IS NULL"
+        )
         works = cursor.fetchall()
         if not candidates or not works:
             return {"candidates": len(candidates), "suggestions": 0}
@@ -677,7 +680,10 @@ def resolve_discovery_entities(connection: psycopg.Connection[Any]) -> dict[str,
 
 def resolve_work_duplicates(connection: psycopg.Connection[Any]) -> dict[str, int]:
     with connection.transaction(), connection.cursor(row_factory=dict_row) as cursor:
-        cursor.execute("SELECT id, title, publication_year FROM works ORDER BY id")
+        cursor.execute(
+            "SELECT id, title, publication_year FROM works "
+            "WHERE merged_into_work_id IS NULL ORDER BY id"
+        )
         works = cursor.fetchall()
         if len(works) < 2:
             return {"works": len(works), "suggestions": 0}

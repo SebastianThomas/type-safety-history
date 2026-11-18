@@ -22,9 +22,22 @@ Apply `db/` first and wait for the CNPG cluster to become ready. Then apply
 The API runs migrations before it becomes ready; the worker waits for
 the schema and claims work afterward.
 
+Load the curated starting queue after migrations:
+
+```bash
+kubectl -n type-safety-history exec deploy/type-safety-history -c api -- \
+  api seed /app/fixtures/seed-works.json
+```
+
+The command is idempotent and does not require outbound network access.
+
 ## Backups
 
 Local volumes are not backups. Back up PostgreSQL and `/data/objects` separately,
 retain checksums, and regularly restore into a disposable namespace. Derived
 data can be regenerated, but restoring it may shorten recovery time.
+
+Exercise restoration and the document-takedown path in a disposable namespace.
+CI runs a black-box workflow covering seed loading, PDF processing, duplicate
+consolidation, takedown and the statistics interface.
 

@@ -43,8 +43,10 @@ pub(crate) fn router() -> Router<AppState> {
         .route("/api/v1/timeline", get(timeline))
         .route("/api/v1/exports", post(create_export))
         .route("/api/v1/exports/{id}", get(get_export))
+        .merge(crate::lifecycle::router())
         .merge(crate::ml::router())
         .merge(crate::research::router())
+        .merge(crate::stats::router())
 }
 
 async fn live() -> Json<Value> {
@@ -89,7 +91,7 @@ async fn list_works(
     let offset = page.offset.max(0);
     let works = sqlx::query_as::<_, Work>(
         "SELECT id, title, work_type::text AS work_type, publication_year, doi, \
-         review_status::text AS review_status FROM works \
+         review_status::text AS review_status FROM works WHERE merged_into_work_id IS NULL \
          ORDER BY publication_year NULLS LAST, title LIMIT $1 OFFSET $2",
     )
     .bind(limit)
@@ -104,8 +106,12 @@ async fn get_work(
     AxumPath(id): AxumPath<Uuid>,
 ) -> Result<Json<Work>, ApiError> {
     let work = sqlx::query_as::<_, Work>(
-        "SELECT id, title, work_type::text AS work_type, publication_year, doi, \
-         review_status::text AS review_status FROM works WHERE id = $1",
+        "SELECT COALESCE(c.id, w.id) AS id, COALESCE(c.title, w.title) AS title, \
+         COALESCE(c.work_type, w.work_type)::text AS work_type, \
+         COALESCE(c.publication_year, w.publication_year) AS publication_year, \
+         COALESCE(c.doi, w.doi) AS doi, \
+         COALESCE(c.review_status, w.review_status)::text AS review_status \
+         FROM works w LEFT JOIN works c ON c.id = w.merged_into_work_id WHERE w.id = $1",
     )
     .bind(id)
     .fetch_optional(&state.db)
@@ -1040,8 +1046,12 @@ async fn import_crossref(
 
 async fn find_work_by_doi(state: &AppState, doi: &str) -> Result<Option<Work>, ApiError> {
     Ok(sqlx::query_as::<_, Work>(
-        "SELECT id, title, work_type::text AS work_type, publication_year, doi, \
-         review_status::text AS review_status FROM works WHERE doi = $1",
+        "SELECT COALESCE(c.id, w.id) AS id, COALESCE(c.title, w.title) AS title, \
+         COALESCE(c.work_type, w.work_type)::text AS work_type, \
+         COALESCE(c.publication_year, w.publication_year) AS publication_year, \
+         COALESCE(c.doi, w.doi) AS doi, \
+         COALESCE(c.review_status, w.review_status)::text AS review_status \
+         FROM works w LEFT JOIN works c ON c.id = w.merged_into_work_id WHERE w.doi = $1",
     )
     .bind(doi)
     .fetch_optional(&state.db)
@@ -1161,7 +1171,8 @@ async fn create_curated_proof(
     let mut tx = state.db.begin().await?;
     let reliable_document_exists: bool = sqlx::query_scalar(
         "SELECT EXISTS(SELECT 1 FROM documents d JOIN sources s ON s.id = d.source_id \
-         WHERE d.id = $1 AND d.work_id = $2 AND s.reliability = 'primary')",
+         WHERE d.id = $1 AND d.work_id = $2 AND d.status = 'active' \
+         AND s.reliability = 'primary')",
     )
     .bind(input.document_id)
     .bind(input.work_id)
