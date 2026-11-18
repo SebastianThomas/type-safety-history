@@ -27,6 +27,15 @@ pub(crate) fn router() -> Router<AppState> {
         .route("/api/v1/documents/register", post(register_document))
         .route("/api/v1/documents/upload", post(upload_document))
         .route("/api/v1/imports/crossref", post(import_crossref))
+        .route("/api/v1/discovery/crossref", post(discover_crossref))
+        .route(
+            "/api/v1/discovery/candidates",
+            get(list_discovery_candidates),
+        )
+        .route(
+            "/api/v1/discovery/candidates/{id}/reject",
+            post(reject_discovery_candidate),
+        )
         .route("/api/v1/proof-results/candidates", get(list_candidates))
         .route("/api/v1/proof-results/curated", post(create_curated_proof))
         .route("/api/v1/proof-results/{id}", get(get_proof_result))
@@ -181,6 +190,203 @@ async fn create_work(
     .await?;
     tx.commit().await?;
     Ok((StatusCode::CREATED, Json(work)))
+}
+
+#[derive(Deserialize)]
+struct CrossrefDiscoveryRequest {
+    query: String,
+    from_year: i32,
+    until_year: i32,
+    #[serde(default = "default_discovery_rows")]
+    rows: u16,
+}
+
+fn default_discovery_rows() -> u16 {
+    20
+}
+
+async fn discover_crossref(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(input): Json<CrossrefDiscoveryRequest>,
+) -> Result<Json<Value>, ApiError> {
+    require_curator(&state, &headers)?;
+    let query = input.query.trim();
+    if !(3..=200).contains(&query.len()) {
+        return Err(ApiError::BadRequest(
+            "query must contain 3-200 characters".into(),
+        ));
+    }
+    if input.from_year < 1800
+        || input.until_year > 2200
+        || input.until_year < input.from_year
+        || input.until_year - input.from_year > 100
+    {
+        return Err(ApiError::BadRequest(
+            "year range must be valid and at most 100 years".into(),
+        ));
+    }
+    if !(1..=100).contains(&input.rows) {
+        return Err(ApiError::BadRequest(
+            "rows must be between 1 and 100".into(),
+        ));
+    }
+    let crossref = state.crossref.as_ref().ok_or(ApiError::NotConfigured(
+        "CROSSREF_MAILTO must be configured",
+    ))?;
+    let discovered = crossref
+        .search(
+            query,
+            Some(input.from_year),
+            Some(input.until_year),
+            input.rows,
+        )
+        .await?;
+    let mut tx = state.db.begin().await?;
+    let mut candidate_ids = Vec::with_capacity(discovered.len());
+    for work in discovered {
+        let candidate_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO discovery_candidates \
+             (provider, external_id, title, publication_year, work_type, raw_metadata) \
+             VALUES ('crossref', $1, $2, $3, $4::work_type, $5) \
+             ON CONFLICT (provider, external_id) DO UPDATE SET \
+                 title = EXCLUDED.title, publication_year = EXCLUDED.publication_year, \
+                 work_type = EXCLUDED.work_type, raw_metadata = EXCLUDED.raw_metadata \
+             RETURNING id",
+        )
+        .bind(&work.doi)
+        .bind(&work.title)
+        .bind(work.publication_year)
+        .bind(work.work_type)
+        .bind(work.selected_metadata)
+        .fetch_one(&mut *tx)
+        .await?;
+        sqlx::query(
+            "INSERT INTO discovery_hits (candidate_id, query_text, from_year, until_year) \
+             VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING",
+        )
+        .bind(candidate_id)
+        .bind(query)
+        .bind(input.from_year)
+        .bind(input.until_year)
+        .execute(&mut *tx)
+        .await?;
+        candidate_ids.push(candidate_id);
+    }
+    sqlx::query(
+        "INSERT INTO audit_log (actor, action, entity_type, after_value, reason) \
+         VALUES ('crossref-discovery', 'discover', 'discovery_candidate', $1, \
+                 'Curator-requested Crossref bibliographic search')",
+    )
+    .bind(json!({
+        "query": query,
+        "from_year": input.from_year,
+        "until_year": input.until_year,
+        "result_count": candidate_ids.len()
+    }))
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(Json(json!({
+        "candidate_ids": candidate_ids,
+        "result_count": candidate_ids.len()
+    })))
+}
+
+#[derive(Deserialize)]
+struct DiscoveryPagination {
+    #[serde(default = "default_limit")]
+    limit: i64,
+    #[serde(default)]
+    offset: i64,
+    #[serde(default = "default_discovery_status")]
+    status: String,
+}
+
+fn default_discovery_status() -> String {
+    "pending".into()
+}
+
+#[derive(Serialize, FromRow)]
+struct DiscoveryCandidate {
+    id: Uuid,
+    provider: String,
+    external_id: String,
+    title: String,
+    publication_year: Option<i32>,
+    work_type: String,
+    status: String,
+    work_id: Option<Uuid>,
+    discovered_at: String,
+    hit_count: i64,
+}
+
+async fn list_discovery_candidates(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(page): Query<DiscoveryPagination>,
+) -> Result<Json<Vec<DiscoveryCandidate>>, ApiError> {
+    require_curator(&state, &headers)?;
+    if !matches!(page.status.as_str(), "pending" | "imported" | "rejected") {
+        return Err(ApiError::BadRequest("invalid discovery status".into()));
+    }
+    let candidates = sqlx::query_as::<_, DiscoveryCandidate>(
+        "SELECT dc.id, dc.provider, dc.external_id, dc.title, dc.publication_year, \
+         dc.work_type::text AS work_type, dc.status::text AS status, dc.work_id, \
+         dc.discovered_at::text AS discovered_at, count(dh.id) AS hit_count \
+         FROM discovery_candidates dc LEFT JOIN discovery_hits dh ON dh.candidate_id = dc.id \
+         WHERE dc.status = $1::discovery_status GROUP BY dc.id \
+         ORDER BY dc.discovered_at DESC LIMIT $2 OFFSET $3",
+    )
+    .bind(&page.status)
+    .bind(page.limit.clamp(1, 200))
+    .bind(page.offset.max(0))
+    .fetch_all(&state.db)
+    .await?;
+    Ok(Json(candidates))
+}
+
+#[derive(Deserialize)]
+struct RejectDiscoveryCandidate {
+    actor: String,
+    reason: String,
+}
+
+async fn reject_discovery_candidate(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<Uuid>,
+    Json(input): Json<RejectDiscoveryCandidate>,
+) -> Result<StatusCode, ApiError> {
+    require_curator(&state, &headers)?;
+    if input.actor.trim().is_empty() || input.reason.trim().is_empty() {
+        return Err(ApiError::BadRequest("actor and reason are required".into()));
+    }
+    let mut tx = state.db.begin().await?;
+    let updated = sqlx::query(
+        "UPDATE discovery_candidates SET status = 'rejected', review_reason = $2, \
+         reviewed_at = now(), work_id = NULL WHERE id = $1 AND status = 'pending'",
+    )
+    .bind(id)
+    .bind(input.reason.trim())
+    .execute(&mut *tx)
+    .await?;
+    if updated.rows_affected() == 0 {
+        return Err(ApiError::NotFound);
+    }
+    sqlx::query(
+        "INSERT INTO audit_log \
+         (actor, action, entity_type, entity_id, after_value, reason) \
+         VALUES ($1, 'reject', 'discovery_candidate', $2, $3, $4)",
+    )
+    .bind(input.actor.trim())
+    .bind(id)
+    .bind(json!({"status": "rejected"}))
+    .bind(input.reason.trim())
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 #[derive(Deserialize)]
@@ -646,6 +852,29 @@ async fn import_crossref(
     }
     let existing = find_work_by_doi(&state, &doi).await?;
     if let Some(work) = existing.filter(|_| !input.refresh) {
+        let mut tx = state.db.begin().await?;
+        let linked = sqlx::query(
+            "UPDATE discovery_candidates SET status = 'imported', work_id = $1, \
+             reviewed_at = now(), review_reason = 'Linked to an existing canonical work' \
+             WHERE provider = 'crossref' AND external_id = $2 AND status = 'pending'",
+        )
+        .bind(work.id)
+        .bind(&doi)
+        .execute(&mut *tx)
+        .await?;
+        if linked.rows_affected() > 0 {
+            sqlx::query(
+                "INSERT INTO audit_log \
+                 (actor, action, entity_type, entity_id, after_value, reason) \
+                 VALUES ('crossref-adapter', 'link_existing', 'work', $1, $2, \
+                         'Pending discovery candidate matched cached DOI')",
+            )
+            .bind(work.id)
+            .bind(json!({"doi": doi}))
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
         return Ok((
             StatusCode::OK,
             Json(CrossrefImportResponse { work, cached: true }),
@@ -744,6 +973,15 @@ async fn import_crossref(
     )
     .bind(work.id)
     .bind(json!({"doi": imported.doi, "new_work": is_new}))
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query(
+        "UPDATE discovery_candidates SET status = 'imported', work_id = $1, \
+         reviewed_at = now(), review_reason = 'Imported through curator DOI lookup' \
+         WHERE provider = 'crossref' AND external_id = $2",
+    )
+    .bind(work.id)
+    .bind(&imported.doi)
     .execute(&mut *tx)
     .await?;
     tx.commit().await?;

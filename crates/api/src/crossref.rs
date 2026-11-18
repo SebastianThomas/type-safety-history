@@ -34,6 +34,17 @@ struct Envelope {
 }
 
 #[derive(Debug, Deserialize)]
+struct SearchEnvelope {
+    message: SearchMessage,
+}
+
+#[derive(Debug, Deserialize)]
+struct SearchMessage {
+    #[serde(default)]
+    items: Vec<CrossrefWork>,
+}
+
+#[derive(Debug, Deserialize)]
 struct CrossrefWork {
     #[serde(rename = "DOI")]
     doi: String,
@@ -118,7 +129,7 @@ impl CrossrefClient {
         // Serialize lookups and stay below even Crossref's public single-record
         // rate. The configured mailto still opts into and identifies the polite pool.
         let mut last_request = self.limiter.lock().await;
-        let next_allowed = *last_request + Duration::from_millis(250);
+        let next_allowed = *last_request + Duration::from_millis(500);
         tokio::time::sleep_until(next_allowed).await;
         let mut url = Url::parse("https://api.crossref.org/v1/works/")
             .expect("static Crossref base URL is valid");
@@ -140,6 +151,58 @@ impl CrossrefClient {
             .await
             .map_err(|error| CrossrefError::InvalidResponse(error.into()))?;
         ImportedWork::try_from(envelope.message)
+    }
+
+    pub(crate) async fn search(
+        &self,
+        query: &str,
+        from_year: Option<i32>,
+        until_year: Option<i32>,
+        rows: u16,
+    ) -> Result<Vec<ImportedWork>, CrossrefError> {
+        let mut last_request = self.limiter.lock().await;
+        let next_allowed = *last_request + Duration::from_millis(500);
+        tokio::time::sleep_until(next_allowed).await;
+        let mut url = Url::parse("https://api.crossref.org/v1/works")
+            .expect("static Crossref works URL is valid");
+        {
+            let mut parameters = url.query_pairs_mut();
+            parameters
+                .append_pair("mailto", &self.mailto)
+                .append_pair("query.bibliographic", query)
+                .append_pair("rows", &rows.to_string())
+                .append_pair(
+                    "select",
+                    "DOI,title,type,author,published,publisher,container-title,URL,license",
+                );
+            let mut filters = Vec::new();
+            if let Some(year) = from_year {
+                filters.push(format!("from-pub-date:{year}"));
+            }
+            if let Some(year) = until_year {
+                filters.push(format!("until-pub-date:{year}"));
+            }
+            if !filters.is_empty() {
+                parameters.append_pair("filter", &filters.join(","));
+            }
+        }
+        *last_request = tokio::time::Instant::now();
+        let response = self.client.get(url).send().await?;
+        match response.status() {
+            StatusCode::TOO_MANY_REQUESTS => return Err(CrossrefError::RateLimited),
+            status if !status.is_success() => return Err(CrossrefError::Http(status)),
+            _ => {}
+        }
+        let envelope: SearchEnvelope = response
+            .json()
+            .await
+            .map_err(|error| CrossrefError::InvalidResponse(error.into()))?;
+        Ok(envelope
+            .message
+            .items
+            .into_iter()
+            .filter_map(|work| ImportedWork::try_from(work).ok())
+            .collect())
     }
 }
 
@@ -224,5 +287,27 @@ mod tests {
         assert_eq!(imported.work_type, "article");
         assert_eq!(imported.doi, "10.1006/inco.1994.1093");
         assert!(imported.selected_metadata.get("abstract").is_none());
+    }
+
+    #[test]
+    fn maps_search_results_without_abstracts() {
+        let response: SearchEnvelope = serde_json::from_value(json!({
+            "message": {"items": [{
+                "DOI": "10.1006/inco.1994.1093",
+                "title": ["A Syntactic Approach to Type Soundness"],
+                "type": "journal-article",
+                "published": {"date-parts": [[1994]]},
+                "abstract": "must not be retained"
+            }]}
+        }))
+        .unwrap();
+        let imported: Vec<_> = response
+            .message
+            .items
+            .into_iter()
+            .filter_map(|work| ImportedWork::try_from(work).ok())
+            .collect();
+        assert_eq!(imported.len(), 1);
+        assert!(imported[0].selected_metadata.get("abstract").is_none());
     }
 }

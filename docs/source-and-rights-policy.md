@@ -37,9 +37,10 @@ retention, redistribution rules and terms URL before it is enabled.
 - Endpoint: one-record lookup at `https://api.crossref.org/v1/works/{doi}`.
 - Identification: required `CROSSREF_MAILTO` query parameter plus an identifying
   user-agent. Anonymous operation is intentionally unsupported.
-- Concurrency: lookups are serialized in-process and locally limited to four
-  requests per second, below Crossref's documented public single-record limit.
-  Each curator call can import only one DOI.
+- Concurrency: requests are serialized in-process and locally limited to two
+  requests per second. This stays below the documented limits for both
+  single-record and more expensive multi-record queries. Each import call can
+  import only one DOI; each discovery call retrieves at most 100 candidates.
 - Caching: a normalized DOI is returned from the local database unless the
   curator explicitly requests a refresh.
 - Backoff: HTTP 429 is surfaced as a retryable service-unavailable response; the
@@ -53,6 +54,13 @@ retention, redistribution rules and terms URL before it is enabled.
   the contents or priority of a theorem.
 - Terms/documentation URL:
   `https://www.crossref.org/documentation/retrieve-metadata/rest-api/`.
+
+Crossref discovery uses `/v1/works` with `query.bibliographic`, an inclusive
+publication-year filter, and `select` so abstracts and unneeded fields never
+arrive. Results enter `pending` discovery state. Search metadata alone cannot
+become a canonical work or proof: a curator must separately import its DOI,
+after which the candidate is linked to the resulting work, or reject it with an
+audited reason.
 
 ## Local ML
 

@@ -59,6 +59,23 @@ curl -X POST http://localhost:8080/api/v1/imports/crossref \
 
 The initial DOI queue is in [`fixtures/seed-works.json`](fixtures/seed-works.json).
 
+## Corpus discovery
+
+Curators can search Crossref bibliographic metadata without importing results:
+
+```bash
+curl -X POST http://localhost:8080/api/v1/discovery/crossref \
+  -H "Authorization: Bearer $CURATOR_TOKEN" \
+  -H 'Content-Type: application/json' \
+  --data '{"query":"type soundness progress preservation","from_year":1990,"until_year":2026,"rows":20}'
+```
+
+The adapter asks Crossref for selected fields only, stores pending candidates,
+and records every query hit. `GET /api/v1/discovery/candidates` lists the review
+queue. Importing a candidate's DOI through `/api/v1/imports/crossref` links it to
+the canonical work; irrelevant candidates can be rejected with an audited
+reason.
+
 ## Local PDF ingestion
 
 PDF acquisition is curator-driven. The upload must include its source URL,
