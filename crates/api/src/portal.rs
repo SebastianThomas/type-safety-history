@@ -10,6 +10,7 @@ use crate::AppState;
 pub(crate) fn router() -> Router<AppState> {
     Router::new()
         .route("/", get(home))
+        .route("/graph", get(graph_portal))
         .route("/curate", get(curator_portal))
         .route("/docs", get(api_docs))
         .route("/api/openapi.json", get(openapi))
@@ -42,6 +43,10 @@ fn html_response(document: &'static str) -> Response {
 
 async fn curator_portal() -> Response {
     html_response(include_str!("../assets/curate.html"))
+}
+
+async fn graph_portal() -> Response {
+    html_response(include_str!("../assets/graph.html"))
 }
 
 async fn api_docs() -> Response {

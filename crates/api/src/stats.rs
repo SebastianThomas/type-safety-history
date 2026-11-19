@@ -31,6 +31,7 @@ struct Overview {
     discovery_possible: i64,
     discovery_unlikely: i64,
     discovery_untriaged: i64,
+    proofs_published: i64,
     proof_candidates: i64,
     proofs_approved: i64,
     proofs_rejected: i64,
@@ -65,6 +66,7 @@ async fn load_overview(state: &AppState) -> Result<Overview, ApiError> {
            (SELECT count(*) FROM discovery_candidates WHERE relevance_category = 'possible') AS discovery_possible,
            (SELECT count(*) FROM discovery_candidates WHERE relevance_category = 'unlikely') AS discovery_unlikely,
            (SELECT count(*) FROM discovery_candidates WHERE status = 'pending' AND triaged_at IS NULL) AS discovery_untriaged,
+           (SELECT count(*) FROM proof_results WHERE status IN ('machine_candidate', 'curator_approved')) AS proofs_published,
            (SELECT count(*) FROM proof_results WHERE status = 'machine_candidate') AS proof_candidates,
            (SELECT count(*) FROM proof_results WHERE status = 'curator_approved') AS proofs_approved,
            (SELECT count(*) FROM proof_results WHERE status = 'rejected') AS proofs_rejected,
@@ -95,7 +97,8 @@ async fn overview(State(state): State<AppState>) -> Result<Json<Value>, ApiError
         "counts": counts,
         "definitions": {
             "discovered": "Unique bibliographic candidates returned by permitted discovery adapters or curated seeds.",
-            "proof_candidates": "Unreviewed machine-generated proof-result candidates.",
+            "proofs_published": "Proof assertions published in the timeline and graph, including explicitly labelled local-ML results.",
+            "proof_candidates": "Machine-generated proof assertions published without requiring manual review.",
             "proofs_approved": "Proof results approved by a curator with evidence.",
             "works": "Non-merged bibliographic work records, including unreviewed machine candidates."
         }
@@ -130,6 +133,10 @@ async fn metrics(State(state): State<AppState>) -> Result<impl IntoResponse, Api
         (
             "type_safety_history_proof_candidates",
             counts.proof_candidates,
+        ),
+        (
+            "type_safety_history_proofs_published",
+            counts.proofs_published,
         ),
         (
             "type_safety_history_proofs_approved",
@@ -296,13 +303,13 @@ th,td{{text-align:right;padding:8px 10px;border-bottom:1px solid var(--line)}} t
 .legend{{display:flex;gap:18px;flex-wrap:wrap;font-size:13px;color:var(--muted);margin:8px 0 16px}} .dot{{display:inline-block;width:9px;height:9px;border-radius:50%;margin-right:5px}}
 @media(max-width:800px){{.grid{{grid-template-columns:repeat(2,1fr)}}header{{display:block}}.stamp{{text-align:left;margin-top:8px}}.funnel{{grid-template-columns:1fr 1fr}}}}
 </style></head><body><main>
-<header><div><h1>Type Safety History</h1><p>Evidence-backed corpus state and research throughput.</p><p><a href="/curate">Curator workspace</a> · <a href="/docs">API docs</a></p></div>
+<header><div><h1>Type Safety History</h1><p>Evidence-backed corpus state and research throughput.</p><p><a href="/graph">Proof graph</a> · <a href="/curate">Optional review</a> · <a href="/docs">API docs</a></p></div>
 <p class="stamp">Auto-refreshes every 60 seconds<br>365-day cumulative view</p></header>
 <section class="grid">
 <div class="card"><div class="label">Bibliographic works</div><div class="value">{works}</div><p>Candidate or reviewed records</p></div>
 <div class="card"><div class="label">Found candidates</div><div class="value">{discovered}</div><p>Unique discovery records</p></div>
-<div class="card"><div class="label">Approved proofs</div><div class="value">{approved}</div><p>Curator verified</p></div>
-<div class="card"><div class="label">Awaiting proof review</div><div class="value">{proof_candidates}</div><p>Machine candidates</p></div>
+<div class="card"><div class="label">Published proofs</div><div class="value">{published}</div><p>Automatic + confirmed</p></div>
+<div class="card"><div class="label">Machine-classified</div><div class="value">{proof_candidates}</div><p>Published without manual review</p></div>
 <div class="card"><div class="label">Active documents</div><div class="value">{documents}</div><p>{taken_down} taken down</p></div>
 <div class="card"><div class="label">Verified artifacts</div><div class="value">{artifacts}</div><p>Formal material</p></div>
 <div class="card"><div class="label">Coverage runs</div><div class="value">{coverage}</div><p>Recorded searches</p></div>
@@ -320,7 +327,7 @@ th,td{{text-align:right;padding:8px 10px;border-bottom:1px solid var(--line)}} t
 <div class="stage"><span>Possible</span><strong>{possible}</strong></div>
 <div class="stage"><span>Unlikely</span><strong>{unlikely}</strong></div>
 <div class="stage"><span>Awaiting triage</span><strong>{untriaged}</strong></div>
-</div><p>Likely and possible records become unreviewed candidate works; proof claims still require evidence review.</p></section>
+</div><p>Likely and possible records become candidate works automatically. Local ML proof assertions are published with confidence, classifier and source-evidence provenance.</p></section>
 <section class="panel"><h2>Source acquisition</h2><div class="funnel">
 <div class="stage"><span>Queued</span><strong>{source_queued}</strong></div>
 <div class="stage"><span>Running</span><strong>{source_running}</strong></div>
@@ -332,10 +339,10 @@ th,td{{text-align:right;padding:8px 10px;border-bottom:1px solid var(--line)}} t
 <section class="panel"><h2>Corpus growth</h2>
 <div class="legend"><span><i class="dot" style="background:#285f8f"></i>Found</span><span><i class="dot" style="background:#39755a"></i>Works</span><span><i class="dot" style="background:#a66b19"></i>Proof results</span><span><i class="dot" style="background:#a64536"></i>Approval events</span></div>
 {chart}</section>
-<section class="panel"><h2>Review backlog over time</h2>
-<div class="legend"><span><i class="dot" style="background:#285f8f"></i>Pending discovery</span><span><i class="dot" style="background:#a66b19"></i>Proof candidates</span><span><i class="dot" style="background:#a64536"></i>Active jobs</span></div>
+<section class="panel"><h2>Automation state over time</h2>
+<div class="legend"><span><i class="dot" style="background:#285f8f"></i>Pending discovery</span><span><i class="dot" style="background:#a66b19"></i>Machine-classified proofs</span><span><i class="dot" style="background:#a64536"></i>Active jobs</span></div>
 {backlog_chart}</section>
-<section class="panel"><h2>Last 14 days</h2><table><thead><tr><th>Date</th><th>Pending discovery</th><th>Proof queue</th><th>Approved proofs</th><th>Active jobs</th></tr></thead><tbody>{recent}</tbody></table></section>
+<section class="panel"><h2>Last 14 days</h2><table><thead><tr><th>Date</th><th>Pending discovery</th><th>Machine proofs</th><th>Confirmed proofs</th><th>Active jobs</th></tr></thead><tbody>{recent}</tbody></table></section>
 <section class="panel"><h2>Review queues</h2><div class="funnel">
 <div class="stage"><span>Duplicate suggestions</span><strong>{duplicates}</strong></div>
 <div class="stage"><span>Entity suggestions</span><strong>{entities}</strong></div>
@@ -345,7 +352,7 @@ th,td{{text-align:right;padding:8px 10px;border-bottom:1px solid var(--line)}} t
 </main></body></html>"#,
         works = counts.works,
         discovered = counts.discovered,
-        approved = counts.proofs_approved,
+        published = counts.proofs_published,
         proof_candidates = counts.proof_candidates,
         documents = counts.active_documents,
         taken_down = counts.documents_taken_down,
@@ -396,7 +403,7 @@ fn svg_backlog_chart(points: &[EvolutionPoint]) -> String {
             (|point: &EvolutionPoint| point.proof_candidates, "#a66b19"),
             (|point: &EvolutionPoint| point.queued_jobs, "#a64536"),
         ],
-        "Review backlog over 365 days",
+        "Automation state over 365 days",
     )
 }
 

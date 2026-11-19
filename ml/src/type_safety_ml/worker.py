@@ -655,7 +655,7 @@ def persist_success(
         for candidate in processed.candidates:
             summary = (
                 f"Page contains terminology associated with {candidate.result_kind.replace('_', ' ')}; "
-                "curator verification is required."
+                "classified automatically by the local evidence extraction pipeline."
             )
             cursor.execute(
                 """

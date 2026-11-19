@@ -1,4 +1,5 @@
 use std::{
+    collections::HashSet,
     path::{Component, Path},
     time::Duration,
 };
@@ -58,6 +59,7 @@ pub(crate) fn router() -> Router<AppState> {
         .route("/api/v1/proof-results/{id}", get(get_proof_result))
         .route("/api/v1/proof-results/{id}/review", post(review_candidate))
         .route("/api/v1/timeline", get(timeline))
+        .route("/api/v1/graph", get(graph))
         .route("/api/v1/exports", post(create_export))
         .route("/api/v1/exports/{id}", get(get_export))
         .merge(crate::auth::router())
@@ -1817,7 +1819,7 @@ fn validate_curated_proof(input: &CreateCuratedProof) -> Result<(), ApiError> {
 }
 
 #[derive(Serialize, FromRow)]
-struct TimelineEntry {
+struct PublicProof {
     work_id: Uuid,
     title: String,
     publication_year: Option<i32>,
@@ -1827,17 +1829,41 @@ struct TimelineEntry {
     result_kind: String,
     proof_method: Option<String>,
     statement_summary: String,
+    verification_status: String,
+    confidence: Option<f32>,
+    classifier_version: Option<String>,
+    source_document_id: Option<Uuid>,
+    page_start: Option<i32>,
+    page_end: Option<i32>,
+    content_sha256: Option<String>,
+    evidence_paraphrase: Option<String>,
+    obligations: Vec<String>,
 }
 
 async fn timeline(
     State(state): State<AppState>,
     Query(page): Query<Pagination>,
-) -> Result<Json<Vec<TimelineEntry>>, ApiError> {
-    let entries = sqlx::query_as::<_, TimelineEntry>(
+) -> Result<Json<Vec<PublicProof>>, ApiError> {
+    let entries = sqlx::query_as::<_, PublicProof>(
         "SELECT w.id AS work_id, w.title, w.publication_year, w.doi, \
          pr.id AS proof_result_id, pr.theorem_name, pr.result_kind, pr.proof_method, \
-         pr.statement_summary FROM proof_results pr JOIN works w ON w.id = pr.work_id \
-         WHERE pr.status = 'curator_approved' \
+         pr.statement_summary, \
+         CASE WHEN pr.status = 'curator_approved' THEN 'curator_approved' \
+              ELSE 'machine_classified' END AS verification_status, \
+         pr.confidence, pr.classifier_version, pr.source_document_id, \
+         proof_evidence.page_start, proof_evidence.page_end, \
+         proof_evidence.content_sha256, proof_evidence.paraphrase AS evidence_paraphrase, \
+         COALESCE((SELECT array_agg(po.obligation_kind ORDER BY po.obligation_kind) \
+                   FROM proof_obligations po WHERE po.proof_result_id = pr.id), \
+                  ARRAY[]::text[]) AS obligations \
+         FROM proof_results pr JOIN works w ON w.id = pr.work_id \
+         LEFT JOIN LATERAL ( \
+             SELECT ds.page_start, ds.page_end, ds.content_sha256, e.paraphrase \
+             FROM evidence e JOIN document_spans ds ON ds.id = e.document_span_id \
+             WHERE e.proof_result_id = pr.id \
+             ORDER BY ds.page_start NULLS LAST, ds.char_start NULLS LAST LIMIT 1 \
+         ) proof_evidence ON true \
+         WHERE pr.status IN ('machine_candidate', 'curator_approved') \
          AND ($1::text IS NULL OR w.title ILIKE '%' || $1 || '%' \
               OR w.doi ILIKE '%' || $1 || '%' OR pr.result_kind ILIKE '%' || $1 || '%') \
          ORDER BY w.publication_year NULLS LAST, w.title, pr.id LIMIT $2 OFFSET $3",
@@ -1853,6 +1879,160 @@ async fn timeline(
     .fetch_all(&state.db)
     .await?;
     Ok(Json(entries))
+}
+
+#[derive(Serialize)]
+struct GraphNode {
+    id: String,
+    kind: &'static str,
+    label: String,
+    publication_year: Option<i32>,
+    doi: Option<String>,
+    result_kind: Option<String>,
+    proof_method: Option<String>,
+    statement_summary: Option<String>,
+    verification_status: Option<String>,
+    confidence: Option<f32>,
+    classifier_version: Option<String>,
+    source_document_id: Option<Uuid>,
+    page_start: Option<i32>,
+    page_end: Option<i32>,
+    content_sha256: Option<String>,
+    evidence_paraphrase: Option<String>,
+}
+
+#[derive(Serialize)]
+struct GraphEdge {
+    source: String,
+    target: String,
+    kind: &'static str,
+    verification_status: String,
+}
+
+async fn graph(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
+    let proofs = sqlx::query_as::<_, PublicProof>(
+        "SELECT w.id AS work_id, w.title, w.publication_year, w.doi, \
+         pr.id AS proof_result_id, pr.theorem_name, pr.result_kind, pr.proof_method, \
+         pr.statement_summary, \
+         CASE WHEN pr.status = 'curator_approved' THEN 'curator_approved' \
+              ELSE 'machine_classified' END AS verification_status, \
+         pr.confidence, pr.classifier_version, pr.source_document_id, \
+         proof_evidence.page_start, proof_evidence.page_end, \
+         proof_evidence.content_sha256, proof_evidence.paraphrase AS evidence_paraphrase, \
+         COALESCE((SELECT array_agg(po.obligation_kind ORDER BY po.obligation_kind) \
+                   FROM proof_obligations po WHERE po.proof_result_id = pr.id), \
+                  ARRAY[]::text[]) AS obligations \
+         FROM proof_results pr JOIN works w ON w.id = pr.work_id \
+         LEFT JOIN LATERAL ( \
+             SELECT ds.page_start, ds.page_end, ds.content_sha256, e.paraphrase \
+             FROM evidence e JOIN document_spans ds ON ds.id = e.document_span_id \
+             WHERE e.proof_result_id = pr.id \
+             ORDER BY ds.page_start NULLS LAST, ds.char_start NULLS LAST LIMIT 1 \
+         ) proof_evidence ON true \
+         WHERE pr.status IN ('machine_candidate', 'curator_approved') \
+         ORDER BY w.publication_year NULLS LAST, w.title, pr.id LIMIT 5000",
+    )
+    .fetch_all(&state.db)
+    .await?;
+
+    let mut nodes = Vec::new();
+    let mut edges = Vec::new();
+    let mut work_ids = HashSet::new();
+    let mut obligation_ids = HashSet::new();
+    for proof in &proofs {
+        let work_id = format!("work:{}", proof.work_id);
+        let proof_id = format!("proof:{}", proof.proof_result_id);
+        if work_ids.insert(proof.work_id) {
+            nodes.push(GraphNode {
+                id: work_id.clone(),
+                kind: "work",
+                label: proof.title.clone(),
+                publication_year: proof.publication_year,
+                doi: proof.doi.clone(),
+                result_kind: None,
+                proof_method: None,
+                statement_summary: None,
+                verification_status: None,
+                confidence: None,
+                classifier_version: None,
+                source_document_id: None,
+                page_start: None,
+                page_end: None,
+                content_sha256: None,
+                evidence_paraphrase: None,
+            });
+        }
+        nodes.push(GraphNode {
+            id: proof_id.clone(),
+            kind: "proof",
+            label: proof
+                .theorem_name
+                .clone()
+                .unwrap_or_else(|| proof.result_kind.replace('_', " ")),
+            publication_year: proof.publication_year,
+            doi: proof.doi.clone(),
+            result_kind: Some(proof.result_kind.clone()),
+            proof_method: proof.proof_method.clone(),
+            statement_summary: Some(proof.statement_summary.clone()),
+            verification_status: Some(proof.verification_status.clone()),
+            confidence: proof.confidence,
+            classifier_version: proof.classifier_version.clone(),
+            source_document_id: proof.source_document_id,
+            page_start: proof.page_start,
+            page_end: proof.page_end,
+            content_sha256: proof.content_sha256.clone(),
+            evidence_paraphrase: proof.evidence_paraphrase.clone(),
+        });
+        edges.push(GraphEdge {
+            source: work_id,
+            target: proof_id.clone(),
+            kind: "reports",
+            verification_status: proof.verification_status.clone(),
+        });
+        for obligation in &proof.obligations {
+            let obligation_id = format!("obligation:{obligation}");
+            if obligation_ids.insert(obligation.clone()) {
+                nodes.push(GraphNode {
+                    id: obligation_id.clone(),
+                    kind: "obligation",
+                    label: obligation.replace('_', " "),
+                    publication_year: None,
+                    doi: None,
+                    result_kind: None,
+                    proof_method: None,
+                    statement_summary: None,
+                    verification_status: None,
+                    confidence: None,
+                    classifier_version: None,
+                    source_document_id: None,
+                    page_start: None,
+                    page_end: None,
+                    content_sha256: None,
+                    evidence_paraphrase: None,
+                });
+            }
+            edges.push(GraphEdge {
+                source: proof_id.clone(),
+                target: obligation_id,
+                kind: "establishes",
+                verification_status: proof.verification_status.clone(),
+            });
+        }
+    }
+
+    Ok(Json(json!({
+        "nodes": nodes,
+        "edges": edges,
+        "counts": {
+            "proofs": proofs.len(),
+            "works": work_ids.len(),
+            "obligations": obligation_ids.len()
+        },
+        "verification_levels": {
+            "machine_classified": "Published automatically from local ML with source evidence; not manually confirmed.",
+            "curator_approved": "Manually confirmed against the cited source evidence."
+        }
+    })))
 }
 
 #[derive(Deserialize)]

@@ -3,7 +3,7 @@
   "info": {
     "title": "Type Safety History API",
     "version": "0.1.0",
-    "description": "Evidence-backed type-safety proof history. Machine output remains a review candidate."
+    "description": "Evidence-backed type-safety proof history. Local-ML output is published with an explicit machine-classified verification label; manual review is optional."
   },
   "servers": [{"url": "/"}],
   "components": {
@@ -57,7 +57,8 @@
     "/api/v1/ml/evaluations": {"get": {"summary": "List local evaluation runs", "security": [{"bearerAuth": []}], "responses": {"200": {"description": "Evaluations"}}}, "post": {"summary": "Queue local evaluation", "security": [{"bearerAuth": []}], "responses": {"202": {"description": "Queued"}}}},
     "/api/v1/stats/overview": {"get": {"summary": "Current corpus state", "responses": {"200": {"description": "Counts and coverage"}}}},
     "/api/v1/stats/evolution": {"get": {"summary": "Corpus evolution", "parameters": [{"name": "days", "in": "query", "schema": {"type": "integer", "minimum": 1, "maximum": 3650}}], "responses": {"200": {"description": "Daily series"}}}},
-    "/api/v1/timeline": {"get": {"summary": "Public approved-proof timeline", "responses": {"200": {"description": "Approved proofs"}}}},
+    "/api/v1/timeline": {"get": {"summary": "Public proof timeline with verification provenance", "parameters": [{"name": "q", "in": "query", "schema": {"type": "string"}}, {"$ref": "#/components/parameters/Limit"}, {"$ref": "#/components/parameters/Offset"}], "responses": {"200": {"description": "Machine-classified and curator-confirmed proofs"}}}},
+    "/api/v1/graph": {"get": {"summary": "Public work-to-proof-to-obligation graph", "responses": {"200": {"description": "Graph nodes and provenance-labelled edges"}}}},
     "/api/v1/exports": {"post": {"summary": "Queue approved-proof Parquet export", "security": [{"bearerAuth": []}], "responses": {"202": {"description": "Queued"}}}},
     "/api/v1/exports/{id}": {"parameters": [{"$ref": "#/components/parameters/Id"}], "get": {"summary": "Get export status", "security": [{"bearerAuth": []}], "responses": {"200": {"description": "Export"}}}},
     "/metrics": {"get": {"summary": "Prometheus corpus and queue metrics", "responses": {"200": {"description": "Prometheus text format"}}}}

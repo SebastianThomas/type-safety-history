@@ -144,9 +144,10 @@ and records every query hit. The network-independent Python worker assigns each
 pending record a reproducible `likely_relevant`, `possible`, or `unlikely`
 ranking from its title and discovery-query labels. Likely and possible records
 are automatically promoted to prioritized, unreviewed candidate works; obvious
-noise is moved to the reversible `screened_out` state. This automation never
-approves a proof or historical claim. `GET /api/v1/discovery/candidates`
-exposes every disposition and its score.
+noise is moved to the reversible `screened_out` state. This automation does not
+apply the stronger `curator_approved` label; local proof extraction is instead
+published explicitly as `machine_classified`. `GET
+/api/v1/discovery/candidates` exposes every disposition and its score.
 
 Recurring, licence-compliant Crossref searches can be created through
 `POST /api/v1/discovery/schedules`. The Rust service claims due schedules,
@@ -190,15 +191,17 @@ curl -X POST http://localhost:8080/api/v1/documents/upload \
 The service streams the file, enforces a 50 MiB limit, validates PDF magic,
 computes SHA-256, and atomically stores it under `/data/objects/sha256/`.
 The local Python worker extracts permitted documents and creates page-level
-machine candidates for curator review. It also writes deterministic page and
+machine classifications that are published with their provenance; curator
+review is optional. It also writes deterministic page and
 document embeddings to local Zarr storage, records document similarity, and
 extracts DOI citation candidates. Scanned pages use local Tesseract OCR as a
 fallback; no document content is sent to a hosted model or OCR service.
 
 ## Local ML review
 
-All ML output remains a suggestion. Curator-protected endpoints expose the
-queues and their audit-preserving resolution actions:
+Local ML proof classifications are published automatically with machine
+provenance. Other probabilistic outputs remain suggestions, and
+curator-protected endpoints expose their audit-preserving resolution actions:
 
 - `GET /api/v1/citation-candidates`
 - `GET /api/v1/entity-resolution-suggestions`
@@ -215,9 +218,9 @@ automatically queues entity resolution. Manual reruns are available through
 
 Open `http://localhost:8080/dashboard` for a read-only view of current corpus
 state. It shows the discovery and source-acquisition funnels, bibliographic
-candidate works, machine proof candidates,
-approved proofs, review queues, queue health and cumulative growth during the
-last year. The page refreshes every minute and does not expose source text.
+candidate works, automatically published machine proof classifications,
+confirmed proofs, queue health and cumulative growth during the last year. The
+page refreshes every minute and does not expose source text.
 
 The same data is available as JSON:
 
@@ -225,10 +228,17 @@ The same data is available as JSON:
 - `GET /api/v1/stats/evolution?days=365`
 
 Evolution includes cumulative discovery/research events and durable
-minute-bucketed snapshots of pending discovery, proof-review and worker queues.
+minute-bucketed snapshots of pending discovery, machine proof classifications
+and worker queues.
 The overview remains authoritative for the current instant.
 
-`/curate` is the authenticated browser workspace for proof, discovery,
+`/graph` is the public work-to-proof-to-obligation view. Machine-classified
+proof assertions appear there immediately with confidence, classifier version,
+source document, page coordinates and evidence hash. Curator-confirmed results
+are visually distinct; confirmation is an optional provenance upgrade, not a
+publication gate.
+
+`/curate` is the optional authenticated browser workspace for proof, discovery,
 duplicate, entity and citation review, work inspection, saved searches, audit
 history and account administration. It stores the bearer token only in the
 browser tab's session storage and loads no third-party JavaScript. API
@@ -249,10 +259,16 @@ work remains as an audited redirect tombstone.
 
 ## Timeline and exports
 
-`GET /api/v1/timeline` returns only curator-approved proof records. Curators can
-create an approved record from a primary-source document using
-`POST /api/v1/proof-results/curated`; exact page evidence, a paraphrase, actor,
-and review reason are mandatory.
+`GET /api/v1/timeline` returns machine-classified and curator-confirmed proof
+records. Every record exposes `verification_status`, local classifier
+provenance, confidence and source-evidence coordinates, so consumers can filter
+by assurance level. `GET /api/v1/graph` exposes the same publication set as
+work-to-proof-to-obligation nodes and edges. No manual action is required for a
+machine result to appear in either interface.
+
+Curators may still create a confirmed record from a primary-source document
+using `POST /api/v1/proof-results/curated`; exact page evidence, a paraphrase,
+actor and review reason remain mandatory for that stronger verification label.
 
 `POST /api/v1/exports` queues a local Parquet export. The sidecar writes a
 checksummed Zstandard-compressed file under `/data/parquet/approved-proofs/`.

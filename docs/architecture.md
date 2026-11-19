@@ -40,8 +40,9 @@ local metadata classifier. It promotes likely and possible records as
 prioritized, unreviewed candidate works and moves obvious noise to a reversible
 screened state. The Rust source resolver then looks up DOI-based open-access
 locations and acquires only explicitly allowlisted, licensed PDFs. Proof results
-and historical claims remain machine candidates until a curator verifies
-primary evidence.
+and historical claims are published from the internal `machine_candidate`
+state with an external `machine_classified` verification label. Optional
+curation upgrades that label after a person verifies primary evidence.
 PostgreSQL keeps the compact document vector and review queues; Zarr keeps the
 reproducible page-level arrays. No vector database or remote model service is
 part of the deployment.

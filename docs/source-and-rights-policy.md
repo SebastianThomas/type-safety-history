@@ -132,7 +132,9 @@ The initial `local-term-baseline-v1` pipeline is deliberately deterministic and
 conservative. It detects terminology associated with progress, preservation,
 subject reduction and type soundness, records only page/character coordinates
 and a paraphrase in PostgreSQL, and leaves every result in `machine_candidate`.
-It is a discovery aid, not evidence that a theorem actually appears or is valid.
+Those results are published as explicitly labelled `machine_classified`
+assertions. They are a discovery aid, not evidence that a theorem actually
+appears or is valid; optional review can upgrade them to `curator_approved`.
 
 Embedded PDF text is preferred. Tesseract is used only as a local fallback for
 pages with little embedded text, and OCR usage is recorded per document. DOI
