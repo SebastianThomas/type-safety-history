@@ -26,6 +26,11 @@ struct Overview {
     discovery_pending: i64,
     discovery_imported: i64,
     discovery_rejected: i64,
+    discovery_screened_out: i64,
+    discovery_likely_relevant: i64,
+    discovery_possible: i64,
+    discovery_unlikely: i64,
+    discovery_untriaged: i64,
     proof_candidates: i64,
     proofs_approved: i64,
     proofs_rejected: i64,
@@ -49,6 +54,11 @@ async fn load_overview(state: &AppState) -> Result<Overview, ApiError> {
            (SELECT count(*) FROM discovery_candidates WHERE status = 'pending') AS discovery_pending,
            (SELECT count(*) FROM discovery_candidates WHERE status = 'imported') AS discovery_imported,
            (SELECT count(*) FROM discovery_candidates WHERE status = 'rejected') AS discovery_rejected,
+           (SELECT count(*) FROM discovery_candidates WHERE status = 'screened_out') AS discovery_screened_out,
+           (SELECT count(*) FROM discovery_candidates WHERE relevance_category = 'likely_relevant') AS discovery_likely_relevant,
+           (SELECT count(*) FROM discovery_candidates WHERE relevance_category = 'possible') AS discovery_possible,
+           (SELECT count(*) FROM discovery_candidates WHERE relevance_category = 'unlikely') AS discovery_unlikely,
+           (SELECT count(*) FROM discovery_candidates WHERE status = 'pending' AND triaged_at IS NULL) AS discovery_untriaged,
            (SELECT count(*) FROM proof_results WHERE status = 'machine_candidate') AS proof_candidates,
            (SELECT count(*) FROM proof_results WHERE status = 'curator_approved') AS proofs_approved,
            (SELECT count(*) FROM proof_results WHERE status = 'rejected') AS proofs_rejected,
@@ -75,7 +85,7 @@ async fn overview(State(state): State<AppState>) -> Result<Json<Value>, ApiError
             "discovered": "Unique bibliographic candidates returned by permitted discovery adapters or curated seeds.",
             "proof_candidates": "Unreviewed machine-generated proof-result candidates.",
             "proofs_approved": "Proof results approved by a curator with evidence.",
-            "works": "Canonical, non-merged scholarly works."
+            "works": "Non-merged bibliographic work records, including unreviewed machine candidates."
         }
     })))
 }
@@ -88,6 +98,22 @@ async fn metrics(State(state): State<AppState>) -> Result<impl IntoResponse, Api
         (
             "type_safety_history_discovery_pending",
             counts.discovery_pending,
+        ),
+        (
+            "type_safety_history_discovery_likely_relevant",
+            counts.discovery_likely_relevant,
+        ),
+        (
+            "type_safety_history_discovery_needs_review",
+            counts.discovery_pending,
+        ),
+        (
+            "type_safety_history_discovery_screened_out",
+            counts.discovery_screened_out,
+        ),
+        (
+            "type_safety_history_discovery_untriaged",
+            counts.discovery_untriaged,
         ),
         (
             "type_safety_history_proof_candidates",
@@ -239,7 +265,7 @@ p{{margin:0;color:var(--muted)}} .stamp{{text-align:right;font-size:13px}} .grid
 .card{{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:18px;box-shadow:0 2px 10px #342b1c0b}}
 .value{{font:700 32px/1 ui-serif,Georgia,serif;margin:8px 0}} .label{{color:var(--muted);font-size:13px;text-transform:uppercase;letter-spacing:.06em}}
 .wide{{grid-column:span 2}} .panel{{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:22px;margin-top:16px;overflow:auto}}
-.funnel{{display:grid;grid-template-columns:repeat(4,1fr);gap:10px}} .stage{{border-left:4px solid var(--blue);padding:10px 12px;background:#285f8f0b}}
+.funnel{{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px}} .stage{{border-left:4px solid var(--blue);padding:10px 12px;background:#285f8f0b}}
 .stage:nth-child(2){{border-color:var(--gold)}} .stage:nth-child(3){{border-color:var(--green)}} .stage:nth-child(4){{border-color:var(--red)}}
 .stage strong{{display:block;font-size:24px}} svg{{width:100%;min-width:620px;height:auto}} table{{width:100%;border-collapse:collapse;font-variant-numeric:tabular-nums}}
 th,td{{text-align:right;padding:8px 10px;border-bottom:1px solid var(--line)}} th:first-child,td:first-child{{text-align:left}} th{{color:var(--muted);font-size:12px;text-transform:uppercase}}
@@ -249,7 +275,7 @@ th,td{{text-align:right;padding:8px 10px;border-bottom:1px solid var(--line)}} t
 <header><div><h1>Type Safety History</h1><p>Evidence-backed corpus state and research throughput.</p><p><a href="/curate">Curator workspace</a> · <a href="/docs">API docs</a></p></div>
 <p class="stamp">Auto-refreshes every 60 seconds<br>365-day cumulative view</p></header>
 <section class="grid">
-<div class="card"><div class="label">Canonical works</div><div class="value">{works}</div><p>Non-merged records</p></div>
+<div class="card"><div class="label">Bibliographic works</div><div class="value">{works}</div><p>Candidate or reviewed records</p></div>
 <div class="card"><div class="label">Found candidates</div><div class="value">{discovered}</div><p>Unique discovery records</p></div>
 <div class="card"><div class="label">Approved proofs</div><div class="value">{approved}</div><p>Curator verified</p></div>
 <div class="card"><div class="label">Awaiting proof review</div><div class="value">{proof_candidates}</div><p>Machine candidates</p></div>
@@ -260,10 +286,17 @@ th,td{{text-align:right;padding:8px 10px;border-bottom:1px solid var(--line)}} t
 </section>
 <section class="panel"><h2>Research funnel</h2><div class="funnel">
 <div class="stage"><span>Found</span><strong>{discovered}</strong></div>
-<div class="stage"><span>Pending import</span><strong>{pending}</strong></div>
+<div class="stage"><span>Needs review</span><strong>{pending}</strong></div>
 <div class="stage"><span>Imported</span><strong>{imported}</strong></div>
-<div class="stage"><span>Rejected</span><strong>{rejected}</strong></div>
+<div class="stage"><span>ML screened out</span><strong>{screened_out}</strong></div>
+<div class="stage"><span>Curator rejected</span><strong>{rejected}</strong></div>
 </div></section>
+<section class="panel"><h2>Local relevance triage</h2><div class="funnel">
+<div class="stage"><span>Likely relevant</span><strong>{likely}</strong></div>
+<div class="stage"><span>Possible</span><strong>{possible}</strong></div>
+<div class="stage"><span>Unlikely</span><strong>{unlikely}</strong></div>
+<div class="stage"><span>Awaiting triage</span><strong>{untriaged}</strong></div>
+</div><p>Local ranking only; import and rejection remain curator decisions.</p></section>
 <section class="panel"><h2>Corpus growth</h2>
 <div class="legend"><span><i class="dot" style="background:#285f8f"></i>Found</span><span><i class="dot" style="background:#39755a"></i>Works</span><span><i class="dot" style="background:#a66b19"></i>Proof results</span><span><i class="dot" style="background:#a64536"></i>Approval events</span></div>
 {chart}</section>
@@ -291,6 +324,11 @@ th,td{{text-align:right;padding:8px 10px;border-bottom:1px solid var(--line)}} t
         pending = counts.discovery_pending,
         imported = counts.discovery_imported,
         rejected = counts.discovery_rejected,
+        screened_out = counts.discovery_screened_out,
+        likely = counts.discovery_likely_relevant,
+        possible = counts.discovery_possible,
+        unlikely = counts.discovery_unlikely,
+        untriaged = counts.discovery_untriaged,
         duplicates = counts.duplicate_suggestions,
         entities = counts.entity_suggestions,
         citations = counts.approved_citations,

@@ -36,6 +36,63 @@ EMBEDDING_ALGORITHM = "sklearn-hashing-word-1-2-v1"
 EMBEDDING_DIMENSIONS = 512
 MAX_CANDIDATES_PER_DOCUMENT = 25
 DOI_PATTERN = re.compile(r"\b10\.\d{4,9}/[-._;()/:A-Z0-9]+", re.IGNORECASE)
+DISCOVERY_TRIAGE_VERSION = "local-tfidf-hybrid-v1"
+
+DISCOVERY_STRONG_PHRASES = (
+    "type soundness",
+    "type safety",
+    "subject reduction",
+    "progress and preservation",
+    "progress & preservation",
+    "syntactic approach to type soundness",
+    "well typed programs cannot go wrong",
+    "well-typed programs cannot go wrong",
+)
+DISCOVERY_CONTEXT_TERMS = (
+    "programming language",
+    "type system",
+    "typed calculus",
+    "lambda calculus",
+    "operational semantics",
+    "static semantics",
+    "preservation theorem",
+    "progress theorem",
+    "type theorem",
+)
+DISCOVERY_NEGATIVE_TERMS = (
+    "patient safety",
+    "food safety",
+    "road safety",
+    "traffic safety",
+    "drug safety",
+    "construction safety",
+    "aviation safety",
+    "nuclear safety",
+    "occupational safety",
+    "workplace safety",
+    "public safety",
+    "fire safety",
+    "water safety",
+    "safety management",
+)
+DISCOVERY_POSITIVE_PROTOTYPES = (
+    "A syntactic approach to type soundness",
+    "Type soundness by progress and preservation",
+    "Subject reduction for a typed lambda calculus",
+    "Safety of a programming language type system",
+    "Operational semantics and type preservation",
+    "Well-typed programs cannot go wrong",
+)
+DISCOVERY_NEGATIVE_PROTOTYPES = (
+    "Patient safety management in hospitals",
+    "Food safety and public health",
+    "Road traffic safety assessment",
+    "Drug safety in clinical practice",
+    "Occupational and workplace safety",
+    "Aviation safety management systems",
+    "Soundness examination in animal breeding",
+    "Syntactic processing in human linguistics",
+)
 
 
 @dataclass(frozen=True)
@@ -66,6 +123,229 @@ class ProcessedDocument:
     zarr_object_key: str
     zarr_manifest_sha256: str
     ocr_page_count: int
+
+
+def score_discovery_candidate(title: str, query_texts: list[str]) -> tuple[float, str]:
+    """Rank metadata locally without changing a candidate's review status."""
+    text = " ".join([title, *query_texts]).lower().replace("–", "-").replace("—", "-")
+    title_text = title.lower().replace("–", "-").replace("—", "-")
+    score = 0.0
+    score += min(0.7, 0.55 * sum(phrase in title_text for phrase in DISCOVERY_STRONG_PHRASES))
+    score += min(0.3, 0.15 * sum(term in title_text for term in DISCOVERY_CONTEXT_TERMS))
+    if "progress" in title_text and "preservation" in title_text:
+        score += 0.45
+    if "soundness" in title_text and ("type" in title_text or "typed" in title_text):
+        score += 0.4
+    if "safety" in title_text and ("type" in title_text or "typed" in title_text):
+        score += 0.3
+    if "type polymorphism" in title_text or "typed programming" in title_text:
+        score += 0.25
+    if any(term in title_text for term in DISCOVERY_NEGATIVE_TERMS):
+        score -= 0.75
+    # A matching discovery query is weak evidence; it must never make a generic title likely.
+    if any(phrase in text for phrase in DISCOVERY_STRONG_PHRASES):
+        score += 0.08
+    score = round(min(1.0, max(0.0, score)), 4)
+    if score >= 0.7:
+        category = "likely_relevant"
+    elif score >= 0.25:
+        category = "possible"
+    else:
+        category = "unlikely"
+    return score, category
+
+
+def classify_discovery_candidates(
+    candidates: list[dict[str, Any]],
+) -> list[tuple[float, str]]:
+    """Apply a local TF-IDF prototype model with conservative lexical features."""
+    if not candidates:
+        return []
+    prototypes = [*DISCOVERY_POSITIVE_PROTOTYPES, *DISCOVERY_NEGATIVE_PROTOTYPES]
+    titles = [candidate["title"] for candidate in candidates]
+    matrix = TfidfVectorizer(analyzer="char_wb", ngram_range=(3, 5)).fit_transform(
+        [*prototypes, *titles]
+    )
+    candidate_vectors = matrix[len(prototypes) :]
+    positive_vectors = matrix[: len(DISCOVERY_POSITIVE_PROTOTYPES)]
+    negative_vectors = matrix[len(DISCOVERY_POSITIVE_PROTOTYPES) : len(prototypes)]
+    positive_scores = cosine_similarity(candidate_vectors, positive_vectors).max(axis=1)
+    negative_scores = cosine_similarity(candidate_vectors, negative_vectors).max(axis=1)
+    classified = []
+    for index, candidate in enumerate(candidates):
+        lexical_score, _ = score_discovery_candidate(candidate["title"], candidate["query_texts"])
+        score = round(
+            min(
+                1.0,
+                max(
+                    0.0,
+                    lexical_score * 0.72
+                    + float(positive_scores[index]) * 0.5
+                    - float(negative_scores[index]) * 0.4,
+                ),
+            ),
+            4,
+        )
+        category = (
+            "likely_relevant" if score >= 0.7 else "possible" if score >= 0.25 else "unlikely"
+        )
+        classified.append((score, category))
+    return classified
+
+
+def normalize_orcid(value: str | None) -> str | None:
+    if not value:
+        return None
+    normalized = value.removeprefix("https://orcid.org/").removeprefix("http://orcid.org/")
+    return normalized or None
+
+
+def promote_discovery_candidate(
+    cursor: psycopg.Cursor[Any], candidate: dict[str, Any], pipeline_run_id: UUID
+) -> UUID:
+    """Promote high-confidence metadata to an explicitly unreviewed candidate work."""
+    metadata = candidate["raw_metadata"]
+    doi_value = (
+        candidate["external_id"] if candidate["provider"] == "crossref" else metadata.get("doi")
+    )
+    doi = (
+        str(doi_value).removeprefix("https://doi.org/").removeprefix("http://doi.org/").lower()
+        if doi_value
+        else None
+    )
+    existing_work_id: UUID | None = None
+    if doi:
+        cursor.execute("SELECT id FROM works WHERE doi = %s", (doi,))
+        existing = cursor.fetchone()
+        existing_work_id = existing["id"] if existing else None
+    else:
+        cursor.execute(
+            """
+            SELECT id FROM works
+            WHERE lower(title) = lower(%s)
+              AND publication_year IS NOT DISTINCT FROM %s
+              AND merged_into_work_id IS NULL
+            ORDER BY created_at LIMIT 1
+            """,
+            (candidate["title"], candidate["publication_year"]),
+        )
+        existing = cursor.fetchone()
+        existing_work_id = existing["id"] if existing else None
+    is_new_work = existing_work_id is None
+    if existing_work_id is not None:
+        work_id = existing_work_id
+    else:
+        if doi:
+            cursor.execute(
+                """
+                INSERT INTO works (title, work_type, publication_year, doi)
+                VALUES (%s, %s::work_type, %s, %s) RETURNING id
+                """,
+                (
+                    candidate["title"],
+                    candidate["work_type"],
+                    candidate["publication_year"],
+                    doi,
+                ),
+            )
+        else:
+            cursor.execute(
+                """
+                INSERT INTO works (title, work_type, publication_year)
+                VALUES (%s, %s::work_type, %s) RETURNING id
+                """,
+                (candidate["title"], candidate["work_type"], candidate["publication_year"]),
+            )
+        work_id = cursor.fetchone()["id"]
+
+    if candidate["provider"] == "crossref":
+        source_url = f"https://api.crossref.org/v1/works/{candidate['external_id']}"
+        source_kind = "doi_registry"
+        terms_url = "https://www.crossref.org/documentation/retrieve-metadata/rest-api/"
+        rights_basis = "Crossref REST API metadata reuse; full text is not acquired."
+    else:
+        source_url = str(metadata.get("openalex_id") or candidate["external_id"])
+        source_kind = "bibliography"
+        terms_url = "https://docs.openalex.org/additional-help/faq#how-is-openalex-licensed"
+        rights_basis = "OpenAlex bibliographic metadata is provided under CC0."
+    cursor.execute(
+        """
+        INSERT INTO sources
+            (work_id, url, source_kind, reliability, rights_status, terms_url,
+             raw_metadata, rights_basis, ml_use_permitted, redistribution_permitted)
+        VALUES (%s, %s, %s::source_kind, 'authoritative_metadata', 'open_metadata_only',
+                %s, %s, %s, false, true)
+        ON CONFLICT (url, work_id) DO UPDATE
+        SET raw_metadata = EXCLUDED.raw_metadata, acquired_at = now()
+        """,
+        (work_id, source_url, source_kind, terms_url, json.dumps(metadata), rights_basis),
+    )
+
+    authors = metadata.get("authors") or [] if is_new_work else []
+    for position, author in enumerate(authors):
+        display_name = author.get("display_name") or " ".join(
+            part for part in (author.get("given"), author.get("family")) if part
+        )
+        display_name = display_name.strip()
+        if not display_name:
+            continue
+        orcid = normalize_orcid(author.get("orcid") or author.get("ORCID"))
+        if orcid:
+            cursor.execute(
+                """
+                INSERT INTO people (display_name, orcid) VALUES (%s, %s)
+                ON CONFLICT (orcid) DO UPDATE SET display_name = EXCLUDED.display_name
+                RETURNING id
+                """,
+                (display_name, orcid),
+            )
+        else:
+            cursor.execute(
+                "INSERT INTO people (display_name) VALUES (%s) RETURNING id",
+                (display_name,),
+            )
+        person_id = cursor.fetchone()["id"]
+        cursor.execute(
+            """
+            INSERT INTO work_authors (work_id, person_id, position)
+            VALUES (%s, %s, %s) ON CONFLICT DO NOTHING
+            """,
+            (work_id, person_id, position),
+        )
+
+    cursor.execute(
+        """
+        UPDATE discovery_candidates
+        SET status = 'imported', work_id = %s, reviewed_at = now(),
+            review_reason = %s
+        WHERE id = %s AND status = 'pending'
+        """,
+        (
+            work_id,
+            f"Automatically promoted by {DISCOVERY_TRIAGE_VERSION}; work remains a machine candidate",
+            candidate["id"],
+        ),
+    )
+    cursor.execute(
+        """
+        INSERT INTO audit_log
+            (actor, action, entity_type, entity_id, after_value, reason)
+        VALUES (%s, 'auto_promote_metadata', 'work', %s, %s, %s)
+        """,
+        (
+            f"ml:{DISCOVERY_TRIAGE_VERSION}",
+            work_id,
+            json.dumps(
+                {
+                    "discovery_candidate_id": str(candidate["id"]),
+                    "pipeline_run_id": str(pipeline_run_id),
+                    "review_status": "candidate",
+                }
+            ),
+            "High-confidence local relevance classification; proof claims remain unverified",
+        ),
+    )
+    return work_id
 
 
 def safe_object_path(data_root: Path, object_key: str) -> Path:
@@ -678,6 +958,134 @@ def resolve_discovery_entities(connection: psycopg.Connection[Any]) -> dict[str,
         return {"candidates": len(candidates), "suggestions": stored}
 
 
+def triage_discovery_candidates(connection: psycopg.Connection[Any]) -> dict[str, int]:
+    """Promote strong metadata, defer ambiguity, and reversibly screen noise."""
+    with connection.transaction(), connection.cursor(row_factory=dict_row) as cursor:
+        cursor.execute(
+            """
+            INSERT INTO pipeline_runs
+                (pipeline_name, pipeline_version, model_name, model_version, configuration)
+            VALUES ('discovery_relevance_triage', %s, 'scikit-learn-char-tfidf', %s, %s)
+            RETURNING id
+            """,
+            (
+                DISCOVERY_TRIAGE_VERSION,
+                DISCOVERY_TRIAGE_VERSION,
+                json.dumps(
+                    {
+                        "input": "bibliographic titles and discovery query labels",
+                        "network_access": False,
+                        "automatic_actions": {
+                            "likely_relevant": "promote_candidate_work",
+                            "possible": "human_review",
+                            "unlikely": "screen_out",
+                        },
+                    }
+                ),
+            ),
+        )
+        pipeline_run_id = cursor.fetchone()["id"]
+        cursor.execute(
+            """
+            SELECT dc.id, dc.provider, dc.external_id, dc.title, dc.publication_year,
+                   dc.work_type::text AS work_type, dc.raw_metadata,
+                   COALESCE(array_agg(dh.query_text ORDER BY dh.query_text)
+                       FILTER (WHERE dh.query_text IS NOT NULL), ARRAY[]::text[]) AS query_texts
+            FROM discovery_candidates dc
+            LEFT JOIN discovery_hits dh ON dh.candidate_id = dc.id
+            WHERE dc.status = 'pending'
+              AND (dc.triaged_at IS NULL OR dc.triage_version <> %s)
+            GROUP BY dc.id
+            ORDER BY dc.id
+            """,
+            (DISCOVERY_TRIAGE_VERSION,),
+        )
+        candidates = cursor.fetchall()
+        counts = {"likely_relevant": 0, "possible": 0, "unlikely": 0}
+        updates: list[tuple[float, str, str, UUID]] = []
+        classifications = classify_discovery_candidates(candidates)
+        for candidate, (score, category) in zip(candidates, classifications, strict=True):
+            candidate["relevance_score"] = score
+            candidate["relevance_category"] = category
+            updates.append((score, category, DISCOVERY_TRIAGE_VERSION, candidate["id"]))
+            counts[category] += 1
+        cursor.executemany(
+            """
+            UPDATE discovery_candidates
+            SET relevance_score = %s, relevance_category = %s,
+                triage_version = %s, triaged_at = now()
+            WHERE id = %s
+            """,
+            updates,
+        )
+        promoted_work_ids = [
+            promote_discovery_candidate(cursor, candidate, pipeline_run_id)
+            for candidate in candidates
+            if candidate["relevance_category"] == "likely_relevant"
+        ]
+        screened_ids = [
+            (candidate["id"],)
+            for candidate in candidates
+            if candidate["relevance_category"] == "unlikely"
+        ]
+        cursor.executemany(
+            """
+            UPDATE discovery_candidates
+            SET status = 'screened_out', reviewed_at = now(),
+                review_reason = %s
+            WHERE id = %s AND status = 'pending'
+            """,
+            [
+                (
+                    f"Automatically screened by {DISCOVERY_TRIAGE_VERSION}; reversible on rediscovery or classifier upgrade",
+                    candidate_id,
+                )
+                for (candidate_id,) in screened_ids
+            ],
+        )
+        if promoted_work_ids:
+            cursor.execute(
+                """
+                INSERT INTO jobs (job_type, idempotency_key, payload)
+                VALUES ('resolve_work_duplicates', %s, %s)
+                ON CONFLICT (idempotency_key) DO NOTHING
+                """,
+                (
+                    f"resolve-work-duplicates:triage:{pipeline_run_id}",
+                    json.dumps({"pipeline_run_id": str(pipeline_run_id)}),
+                ),
+            )
+        cursor.execute(
+            """
+            INSERT INTO audit_log (actor, action, entity_type, after_value, reason)
+            VALUES (%s, 'automated_triage', 'discovery_candidate', %s, %s)
+            """,
+            (
+                f"ml:{DISCOVERY_TRIAGE_VERSION}",
+                json.dumps(
+                    {
+                        "pipeline_run_id": str(pipeline_run_id),
+                        "promoted": len(promoted_work_ids),
+                        "human_review": counts["possible"],
+                        "screened_out": len(screened_ids),
+                    }
+                ),
+                "Local metadata classifier applied reversible automated dispositions",
+            ),
+        )
+        cursor.execute(
+            "UPDATE pipeline_runs SET finished_at = now() WHERE id = %s",
+            (pipeline_run_id,),
+        )
+        return {
+            "candidates": len(candidates),
+            "promoted": len(promoted_work_ids),
+            "human_review": counts["possible"],
+            "screened_out": len(screened_ids),
+            **counts,
+        }
+
+
 def resolve_work_duplicates(connection: psycopg.Connection[Any]) -> dict[str, int]:
     with connection.transaction(), connection.cursor(row_factory=dict_row) as cursor:
         cursor.execute(
@@ -850,6 +1258,10 @@ def run() -> None:
                         elif job["job_type"] == "resolve_discovery_entities":
                             persist_generic_job_success(
                                 connection, job["id"], resolve_discovery_entities(connection)
+                            )
+                        elif job["job_type"] == "triage_discovery_candidates":
+                            persist_generic_job_success(
+                                connection, job["id"], triage_discovery_candidates(connection)
                             )
                         elif job["job_type"] == "resolve_work_duplicates":
                             persist_generic_job_success(

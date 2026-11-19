@@ -317,7 +317,11 @@ async fn run_crossref_discovery(
              VALUES ('crossref', $1, $2, $3, $4::work_type, $5) \
              ON CONFLICT (provider, external_id) DO UPDATE SET \
                  title = EXCLUDED.title, publication_year = EXCLUDED.publication_year, \
-                 work_type = EXCLUDED.work_type, raw_metadata = EXCLUDED.raw_metadata \
+                 work_type = EXCLUDED.work_type, raw_metadata = EXCLUDED.raw_metadata, \
+                 status = CASE WHEN discovery_candidates.status = 'screened_out' \
+                     THEN 'pending'::discovery_status ELSE discovery_candidates.status END, \
+                 relevance_score = NULL, relevance_category = NULL, \
+                 triage_version = NULL, triaged_at = NULL \
              RETURNING id",
         )
         .bind(&work.doi)
@@ -381,11 +385,22 @@ async fn run_crossref_discovery(
     .bind(json!({"candidate_ids": candidate_ids}))
     .execute(&mut *tx)
     .await?;
+    let triage_job_id = Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO jobs (id, job_type, idempotency_key, payload) \
+         VALUES ($1, 'triage_discovery_candidates', $2, $3)",
+    )
+    .bind(triage_job_id)
+    .bind(format!("triage-discovery:{triage_job_id}"))
+    .bind(json!({"candidate_ids": candidate_ids}))
+    .execute(&mut *tx)
+    .await?;
     tx.commit().await?;
     Ok(json!({
         "candidate_ids": candidate_ids,
         "result_count": candidate_ids.len(),
-        "resolution_job_id": resolution_job_id
+        "resolution_job_id": resolution_job_id,
+        "triage_job_id": triage_job_id
     }))
 }
 
@@ -431,7 +446,11 @@ async fn run_openalex_discovery(
              VALUES ('openalex', $1, $2, $3, $4::work_type, $5) \
              ON CONFLICT (provider, external_id) DO UPDATE SET \
                  title = EXCLUDED.title, publication_year = EXCLUDED.publication_year, \
-                 work_type = EXCLUDED.work_type, raw_metadata = EXCLUDED.raw_metadata \
+                 work_type = EXCLUDED.work_type, raw_metadata = EXCLUDED.raw_metadata, \
+                 status = CASE WHEN discovery_candidates.status = 'screened_out' \
+                     THEN 'pending'::discovery_status ELSE discovery_candidates.status END, \
+                 relevance_score = NULL, relevance_category = NULL, \
+                 triage_version = NULL, triaged_at = NULL \
              RETURNING id",
         )
         .bind(work.external_id)
@@ -498,11 +517,22 @@ async fn run_openalex_discovery(
     .bind(json!({"candidate_ids": candidate_ids}))
     .execute(&mut *tx)
     .await?;
+    let triage_job_id = Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO jobs (id, job_type, idempotency_key, payload) \
+         VALUES ($1, 'triage_discovery_candidates', $2, $3)",
+    )
+    .bind(triage_job_id)
+    .bind(format!("triage-discovery:{triage_job_id}"))
+    .bind(json!({"candidate_ids": candidate_ids}))
+    .execute(&mut *tx)
+    .await?;
     tx.commit().await?;
     Ok(json!({
         "candidate_ids": candidate_ids,
         "result_count": candidate_ids.len(),
-        "resolution_job_id": resolution_job_id
+        "resolution_job_id": resolution_job_id,
+        "triage_job_id": triage_job_id
     }))
 }
 
@@ -798,6 +828,10 @@ struct DiscoveryCandidate {
     work_id: Option<Uuid>,
     discovered_at: String,
     hit_count: i64,
+    relevance_score: Option<f32>,
+    relevance_category: Option<String>,
+    triage_version: Option<String>,
+    triaged_at: Option<String>,
 }
 
 async fn list_discovery_candidates(
@@ -806,16 +840,22 @@ async fn list_discovery_candidates(
     Query(page): Query<DiscoveryPagination>,
 ) -> Result<Json<Vec<DiscoveryCandidate>>, ApiError> {
     require_viewer(&state, &headers).await?;
-    if !matches!(page.status.as_str(), "pending" | "imported" | "rejected") {
+    if !matches!(
+        page.status.as_str(),
+        "pending" | "imported" | "rejected" | "screened_out"
+    ) {
         return Err(ApiError::BadRequest("invalid discovery status".into()));
     }
     let candidates = sqlx::query_as::<_, DiscoveryCandidate>(
         "SELECT dc.id, dc.provider, dc.external_id, dc.title, dc.publication_year, \
          dc.work_type::text AS work_type, dc.status::text AS status, dc.work_id, \
-         dc.discovered_at::text AS discovered_at, count(dh.id) AS hit_count \
+         dc.discovered_at::text AS discovered_at, count(dh.id) AS hit_count, \
+         dc.relevance_score, dc.relevance_category, dc.triage_version, \
+         dc.triaged_at::text AS triaged_at \
          FROM discovery_candidates dc LEFT JOIN discovery_hits dh ON dh.candidate_id = dc.id \
          WHERE dc.status = $1::discovery_status GROUP BY dc.id \
-         ORDER BY dc.discovered_at DESC LIMIT $2 OFFSET $3",
+         ORDER BY dc.relevance_score DESC NULLS LAST, dc.discovered_at DESC \
+         LIMIT $2 OFFSET $3",
     )
     .bind(&page.status)
     .bind(page.limit.clamp(1, 200))

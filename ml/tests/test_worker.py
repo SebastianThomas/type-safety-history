@@ -6,6 +6,7 @@ import zarr
 
 from type_safety_ml.worker import (
     EMBEDDING_DIMENSIONS,
+    classify_discovery_candidates,
     classify_pages,
     extract_citation_candidates,
     safe_object_path,
@@ -70,3 +71,42 @@ def test_citation_candidates_store_hash_not_context() -> None:
     assert len(candidates) == 1
     assert candidates[0].doi == "10.1145/1234.5678"
     assert len(candidates[0].context_sha256) == 64
+
+
+def test_discovery_triage_prioritizes_type_soundness() -> None:
+    score, category = classify_discovery_candidates(
+        [
+            {
+                "title": "A Syntactic Approach to Type Soundness",
+                "query_texts": ["type soundness programming language"],
+            }
+        ]
+    )[0]
+    assert score >= 0.7
+    assert category == "likely_relevant"
+
+
+def test_discovery_triage_demotes_unrelated_safety_results() -> None:
+    score, category = classify_discovery_candidates(
+        [
+            {
+                "title": "Food safety management in regional restaurants",
+                "query_texts": ["type safety programming language"],
+            }
+        ]
+    )[0]
+    assert score < 0.25
+    assert category == "unlikely"
+
+
+def test_discovery_triage_keeps_historical_precursors_for_review() -> None:
+    score, category = classify_discovery_candidates(
+        [
+            {
+                "title": "A Theory of Type Polymorphism in Programming",
+                "query_texts": ["curated-seed:historical_precursor"],
+            }
+        ]
+    )[0]
+    assert score >= 0.25
+    assert category == "possible"

@@ -84,6 +84,14 @@ migrations install the curated anchors and default discovery schedules. Storage
 verification remains an explicit restoration/integrity operation instead of
 blocking every application restart.
 
+Migration `0012_discovery_triage.sql` queues one idempotent local triage job for
+all pre-existing pending candidates. Each later discovery batch queues the same
+worker operation for new or refreshed metadata. Observe progress through
+`discovery_untriaged`, `discovery_likely_relevant`, and the active-job counters
+on `/dashboard`, `/api/v1/stats/overview`, or `/metrics`. A completed triage run
+promotes likely records as candidate works, screens unlikely records without
+deleting them, and leaves only the uncertain band pending in `/curate`.
+
 Application Deployments use `Recreate` and retain all durable state in CNPG and
 the local PVC. Discovery schedules and worker jobs use expiring database leases;
 an API or worker process killed after claiming work can therefore be retried by

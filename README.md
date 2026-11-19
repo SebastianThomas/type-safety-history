@@ -140,15 +140,20 @@ curl -X POST http://localhost:8080/api/v1/discovery/crossref \
 ```
 
 The adapter asks Crossref for selected fields only, stores pending candidates,
-and records every query hit. `GET /api/v1/discovery/candidates` lists the review
-queue. Importing a candidate's DOI through `/api/v1/imports/crossref` links it to
-the canonical work; irrelevant candidates can be rejected with an audited
-reason.
+and records every query hit. The network-independent Python worker assigns each
+pending record a reproducible `likely_relevant`, `possible`, or `unlikely`
+ranking from its title and discovery-query labels. High-confidence records are
+automatically promoted to unreviewed candidate works, obvious noise is moved to
+the reversible `screened_out` state, and only ambiguous records remain pending
+in `/curate`. This automation never approves a proof or historical claim.
+`GET /api/v1/discovery/candidates` exposes every disposition and its score;
+curators can still import or reject an ambiguous record explicitly.
 
 Recurring, licence-compliant Crossref searches can be created through
 `POST /api/v1/discovery/schedules`. The Rust service claims due schedules,
-records every coverage run, and queues local entity resolution. Schedules have
-a minimum hourly cadence and can be disabled or run manually from `/curate`.
+records every coverage run, and queues local relevance triage and entity
+resolution. Schedules have a minimum hourly cadence and can be disabled or run
+manually from `/curate`.
 
 When `OPENALEX_API_KEY` is configured, curators can also search selected
 OpenAlex bibliographic metadata through `POST /api/v1/discovery/openalex`.
