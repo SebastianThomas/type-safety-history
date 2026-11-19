@@ -218,7 +218,19 @@ def promote_discovery_candidate(
         cursor.execute("SELECT id FROM works WHERE doi = %s", (doi,))
         existing = cursor.fetchone()
         existing_work_id = existing["id"] if existing else None
-    else:
+    if existing_work_id is None:
+        cursor.execute(
+            """
+            SELECT work_id AS id
+            FROM entity_resolution_suggestions
+            WHERE discovery_candidate_id = %s AND status = 'pending' AND score >= 0.9
+            ORDER BY score DESC LIMIT 1
+            """,
+            (candidate["id"],),
+        )
+        existing = cursor.fetchone()
+        existing_work_id = existing["id"] if existing else None
+    if existing_work_id is None and not doi:
         cursor.execute(
             """
             SELECT id FROM works
@@ -344,6 +356,32 @@ def promote_discovery_candidate(
             ),
             "High-confidence local relevance classification; proof claims remain unverified",
         ),
+    )
+    cursor.execute(
+        """
+        UPDATE entity_resolution_suggestions
+        SET status = CASE WHEN work_id = %s THEN 'accepted'::resolution_status
+                          ELSE 'rejected'::resolution_status END,
+            resolved_by = %s, resolved_at = now(),
+            resolution_reason = 'Resolved during automated bibliographic promotion'
+        WHERE discovery_candidate_id = %s AND status = 'pending'
+        """,
+        (work_id, f"ml:{DISCOVERY_TRIAGE_VERSION}", candidate["id"]),
+    )
+    priority = round(float(candidate.get("relevance_score") or 0.5) * 100)
+    cursor.execute(
+        """
+        INSERT INTO source_resolution_queue (work_id, priority)
+        VALUES (%s, %s)
+        ON CONFLICT (work_id) DO UPDATE
+        SET priority = GREATEST(source_resolution_queue.priority, EXCLUDED.priority),
+            status = CASE WHEN source_resolution_queue.status = 'resolved'
+                          THEN source_resolution_queue.status ELSE 'queued' END,
+            available_at = CASE WHEN source_resolution_queue.status = 'resolved'
+                                THEN source_resolution_queue.available_at ELSE now() END,
+            updated_at = now()
+        """,
+        (work_id, priority),
     )
     return work_id
 
@@ -977,7 +1015,7 @@ def triage_discovery_candidates(connection: psycopg.Connection[Any]) -> dict[str
                         "network_access": False,
                         "automatic_actions": {
                             "likely_relevant": "promote_candidate_work",
-                            "possible": "human_review",
+                            "possible": "promote_low_priority_candidate_work",
                             "unlikely": "screen_out",
                         },
                     }
@@ -1021,7 +1059,7 @@ def triage_discovery_candidates(connection: psycopg.Connection[Any]) -> dict[str
         promoted_work_ids = [
             promote_discovery_candidate(cursor, candidate, pipeline_run_id)
             for candidate in candidates
-            if candidate["relevance_category"] == "likely_relevant"
+            if candidate["relevance_category"] in {"likely_relevant", "possible"}
         ]
         screened_ids = [
             (candidate["id"],)
@@ -1066,7 +1104,7 @@ def triage_discovery_candidates(connection: psycopg.Connection[Any]) -> dict[str
                     {
                         "pipeline_run_id": str(pipeline_run_id),
                         "promoted": len(promoted_work_ids),
-                        "human_review": counts["possible"],
+                        "human_review": 0,
                         "screened_out": len(screened_ids),
                     }
                 ),
@@ -1080,10 +1118,66 @@ def triage_discovery_candidates(connection: psycopg.Connection[Any]) -> dict[str
         return {
             "candidates": len(candidates),
             "promoted": len(promoted_work_ids),
-            "human_review": counts["possible"],
+            "human_review": 0,
             "screened_out": len(screened_ids),
             **counts,
         }
+
+
+def promote_possible_candidates(connection: psycopg.Connection[Any]) -> dict[str, int]:
+    """Migrate already-triaged ambiguous metadata into low-priority candidate works."""
+    with connection.transaction(), connection.cursor(row_factory=dict_row) as cursor:
+        cursor.execute(
+            """
+            INSERT INTO pipeline_runs
+                (pipeline_name, pipeline_version, model_name, model_version, configuration)
+            VALUES ('discovery_candidate_promotion', %s, 'policy', 'promote-possible-v1', %s)
+            RETURNING id
+            """,
+            (
+                DISCOVERY_TRIAGE_VERSION,
+                json.dumps(
+                    {
+                        "category": "possible",
+                        "review_status": "candidate",
+                        "proof_claims_approved": False,
+                    }
+                ),
+            ),
+        )
+        pipeline_run_id = cursor.fetchone()["id"]
+        cursor.execute(
+            """
+            SELECT id, provider, external_id, title, publication_year,
+                   work_type::text AS work_type, raw_metadata,
+                   relevance_score, relevance_category
+            FROM discovery_candidates
+            WHERE status = 'pending' AND relevance_category = 'possible'
+            ORDER BY relevance_score DESC, id
+            """
+        )
+        candidates = cursor.fetchall()
+        work_ids = [
+            promote_discovery_candidate(cursor, candidate, pipeline_run_id)
+            for candidate in candidates
+        ]
+        if work_ids:
+            cursor.execute(
+                """
+                INSERT INTO jobs (job_type, idempotency_key, payload)
+                VALUES ('resolve_work_duplicates', %s, %s)
+                ON CONFLICT (idempotency_key) DO NOTHING
+                """,
+                (
+                    f"resolve-work-duplicates:promotion:{pipeline_run_id}",
+                    json.dumps({"pipeline_run_id": str(pipeline_run_id)}),
+                ),
+            )
+        cursor.execute(
+            "UPDATE pipeline_runs SET finished_at = now() WHERE id = %s",
+            (pipeline_run_id,),
+        )
+        return {"candidates": len(candidates), "promoted": len(work_ids)}
 
 
 def resolve_work_duplicates(connection: psycopg.Connection[Any]) -> dict[str, int]:
@@ -1262,6 +1356,10 @@ def run() -> None:
                         elif job["job_type"] == "triage_discovery_candidates":
                             persist_generic_job_success(
                                 connection, job["id"], triage_discovery_candidates(connection)
+                            )
+                        elif job["job_type"] == "promote_possible_candidates":
+                            persist_generic_job_success(
+                                connection, job["id"], promote_possible_candidates(connection)
                             )
                         elif job["job_type"] == "resolve_work_duplicates":
                             persist_generic_job_success(

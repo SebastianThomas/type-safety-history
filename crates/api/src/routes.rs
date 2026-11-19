@@ -65,6 +65,7 @@ pub(crate) fn router() -> Router<AppState> {
         .merge(crate::ml::router())
         .merge(crate::portal::router())
         .merge(crate::research::router())
+        .merge(crate::source_resolution::router())
         .merge(crate::stats::router())
 }
 

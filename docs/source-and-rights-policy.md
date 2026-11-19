@@ -42,7 +42,7 @@ retention, redistribution rules and terms URL before it is enabled.
 - Concurrency: requests are serialized in-process and locally limited to two
   requests per second. This stays below the documented limits for both
   single-record and more expensive multi-record queries. Each import call can
-  import only one DOI; each discovery call retrieves at most 100 candidates.
+  import only one DOI; each discovery call retrieves at most 1,000 candidates.
 - Caching: a normalized DOI is returned from the local database unless the
   curator explicitly requests a refresh.
 - Backoff: HTTP 429 is surfaced as a retryable service-unavailable response; the
@@ -59,15 +59,42 @@ retention, redistribution rules and terms URL before it is enabled.
 
 Crossref discovery uses `/v1/works` with `query.bibliographic`, an inclusive
 publication-year filter, and `select` so abstracts and unneeded fields never
-arrive. Results enter `pending` discovery state. Search metadata alone cannot
-become a canonical work or proof: a curator must separately import its DOI,
-after which the candidate is linked to the resulting work, or reject it with an
-audited reason.
+arrive. Results enter local ML triage. Likely and possible records may become
+unreviewed candidate works automatically; search metadata alone can never
+approve a proof or historical claim.
 
 Saved searches use the same endpoint, field selection, contact identification
 and in-process rate limiter. Their cadence cannot be shorter than one hour.
-Scheduling does not grant permission to download linked documents: every PDF
-still requires a separate curator-recorded rights decision.
+Scheduling does not grant permission to download linked documents. The separate
+source resolver requires an explicit allowlisted location-level licence.
+
+## Enabled adapter: Unpaywall REST API v2
+
+- Endpoint: `https://api.unpaywall.org/v2/{doi}`.
+- Identification: the monitored `CROSSREF_MAILTO` value is supplied as the
+  required `email` query parameter; requests are serialized and limited to five
+  per second.
+- Purpose: locate an explicitly licensed PDF for candidate works with a DOI.
+  The best location is preferred, with fallback across reported OA locations
+  when the best record has no direct PDF. Unpaywall metadata does not itself
+  become scholarly evidence.
+- Automatic allowlist: `cc0`, `public-domain`, and `cc-by*` except any `-nd`
+  variant. Missing, implied, publisher-specific, unknown and ND licences are
+  never downloaded automatically.
+- Network boundary: downloads must remain credential-free HTTPS across every
+  redirect and every resolved address must be public. Responses must declare
+  `application/pdf`, begin with PDF magic and remain within 50 MiB.
+- Retention: exact location/licence metadata, rights basis, SHA-256 and the
+  content-addressed object key are retained. Automatic acquisitions permit
+  local ML but are not marked for redistribution.
+- Failure behavior: missing copies and DOI-less works are recorded; ambiguous
+  rights enter `rights_review`; these terminal-looking outcomes are retried
+  monthly because availability and licence metadata can improve. Transient
+  failures use bounded backoff and expiring leases.
+- Documentation and terms:
+  `https://data.unpaywall.org/products/api`,
+  `https://data.unpaywall.org/data-format`, and
+  `https://unpaywall.org/legal/terms-of-service`.
 
 ## Optional adapter: OpenAlex Works API
 
@@ -119,7 +146,8 @@ calculate local precision, recall and F1 for a recorded pipeline version.
 A local PDF is accepted only when the curator records a reliable source URL and
 a specific rights basis. `open_redistributable` requires a licence name and URL.
 `internal_research_copy` can never be marked redistributable. Metadata-only,
-link-only, unknown and prohibited sources cannot be uploaded. File bytes are
-not fetched by the service from the recorded URL; acquisition remains a human
-action performed under the source's applicable terms.
+link-only, unknown and prohibited sources cannot be uploaded. File bytes may
+also be acquired by the Unpaywall adapter under the strict explicit-licence
+policy above. All other acquisition remains a human action performed under the
+source's applicable terms.
 

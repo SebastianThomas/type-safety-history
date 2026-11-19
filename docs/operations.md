@@ -92,6 +92,13 @@ on `/dashboard`, `/api/v1/stats/overview`, or `/metrics`. A completed triage run
 promotes likely records as candidate works, screens unlikely records without
 deleting them, and leaves only the uncertain band pending in `/curate`.
 
+Migration `0013_source_acquisition.sql` promotes the already-triaged `possible`
+band as lower-priority candidate works and queues every work without a document
+for source resolution. The Rust API owns this network-facing queue; its claims
+have five-minute leases and survive API restarts. The Python worker remains
+network-independent. Inspect queued, acquired, unavailable, rights-review and
+failed counts on `/dashboard`, or individual records in the Sources tab.
+
 Application Deployments use `Recreate` and retain all durable state in CNPG and
 the local PVC. Discovery schedules and worker jobs use expiring database leases;
 an API or worker process killed after claiming work can therefore be retried by

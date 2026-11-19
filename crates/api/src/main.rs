@@ -8,6 +8,7 @@ mod portal;
 mod research;
 mod routes;
 mod seed;
+mod source_resolution;
 mod stats;
 
 use std::{
@@ -32,6 +33,7 @@ pub(crate) struct AppState {
     pub curator_token: Option<Arc<str>>,
     pub crossref: Option<crossref::CrossrefClient>,
     pub openalex: Option<openalex::OpenAlexClient>,
+    pub unpaywall: Option<source_resolution::UnpaywallClient>,
 }
 
 #[tokio::main]
@@ -90,14 +92,26 @@ async fn main() -> Result<()> {
         .ok()
         .filter(|token| !token.trim().is_empty())
         .map(Arc::<str>::from);
-    let crossref = match env::var("CROSSREF_MAILTO") {
-        Ok(mailto) if !mailto.trim().is_empty() => Some(crossref::CrossrefClient::new(
+    let research_contact = env::var("CROSSREF_MAILTO")
+        .ok()
+        .filter(|mailto| !mailto.trim().is_empty());
+    let crossref = match research_contact.clone() {
+        Some(mailto) => Some(crossref::CrossrefClient::new(
             mailto,
             env::var("CROSSREF_USER_AGENT").unwrap_or_else(|_| {
                 "type-safety-history/0.1 (+https://type-safety-history.sthomas.ch)".into()
             }),
         )?),
         _ => None,
+    };
+    let unpaywall = match research_contact {
+        Some(email) => Some(source_resolution::UnpaywallClient::new(
+            email,
+            env::var("SOURCE_RESOLVER_USER_AGENT").unwrap_or_else(|_| {
+                "type-safety-history/0.1 (+https://type-safety-history.sthomas.ch)".into()
+            }),
+        )?),
+        None => None,
     };
     let openalex = match env::var("OPENALEX_API_KEY") {
         Ok(api_key) if !api_key.trim().is_empty() => Some(openalex::OpenAlexClient::new(
@@ -114,8 +128,10 @@ async fn main() -> Result<()> {
         curator_token,
         crossref,
         openalex,
+        unpaywall,
     };
     let discovery_scheduler = tokio::spawn(routes::run_discovery_scheduler(state.clone()));
+    let source_resolver = tokio::spawn(source_resolution::run_source_resolver(state.clone()));
     let app = Router::new()
         .merge(routes::router())
         .layer(DefaultBodyLimit::max(64 * 1024 * 1024))
@@ -134,6 +150,7 @@ async fn main() -> Result<()> {
         .with_graceful_shutdown(shutdown_signal())
         .await;
     discovery_scheduler.abort();
+    source_resolver.abort();
     serve_result?;
     Ok(())
 }

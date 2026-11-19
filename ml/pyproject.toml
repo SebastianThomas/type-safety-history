@@ -4,6 +4,7 @@ version = "0.1.0"
 description = "Local-only document extraction and ML worker"
 requires-python = ">=3.13"
 dependencies = [
+  "fonttools>=4,<5",
   "psycopg[binary]>=3.2,<4",
   "pypdf>=6,<8",
   "pypdfium2>=5,<6",

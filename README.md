@@ -142,12 +142,11 @@ curl -X POST http://localhost:8080/api/v1/discovery/crossref \
 The adapter asks Crossref for selected fields only, stores pending candidates,
 and records every query hit. The network-independent Python worker assigns each
 pending record a reproducible `likely_relevant`, `possible`, or `unlikely`
-ranking from its title and discovery-query labels. High-confidence records are
-automatically promoted to unreviewed candidate works, obvious noise is moved to
-the reversible `screened_out` state, and only ambiguous records remain pending
-in `/curate`. This automation never approves a proof or historical claim.
-`GET /api/v1/discovery/candidates` exposes every disposition and its score;
-curators can still import or reject an ambiguous record explicitly.
+ranking from its title and discovery-query labels. Likely and possible records
+are automatically promoted to prioritized, unreviewed candidate works; obvious
+noise is moved to the reversible `screened_out` state. This automation never
+approves a proof or historical claim. `GET /api/v1/discovery/candidates`
+exposes every disposition and its score.
 
 Recurring, licence-compliant Crossref searches can be created through
 `POST /api/v1/discovery/schedules`. The Rust service claims due schedules,
@@ -160,7 +159,21 @@ OpenAlex bibliographic metadata through `POST /api/v1/discovery/openalex`.
 OpenAlex metadata is retained under CC0; abstracts, full-text URLs and document
 content are deliberately excluded by the adapter.
 
-## Local PDF ingestion
+## Licence-gated PDF acquisition
+
+Candidate works with a DOI automatically enter the source-resolution queue.
+The Rust service queries Unpaywall using `CROSSREF_MAILTO`, but downloads only a
+direct PDF whose selected location reports an explicit allowlisted Creative
+Commons or public-domain licence. Implied, missing, unknown and ND licences,
+missing PDF links, and DOI-less records remain visible through
+`GET /api/v1/source-resolution` and the Sources tab in `/curate`. Downloads are
+restricted to credential-free public HTTPS destinations, bounded to 50 MiB,
+validated as PDFs, checksummed and written to content-addressed local storage.
+The service records the exact licence, location, rights basis and audit event,
+then queues local extraction. Source files are not redistributed automatically.
+
+Manual PDF ingestion remains available when a curator can establish a rights
+basis that an automated metadata source cannot:
 
 PDF acquisition is curator-driven. The upload must include its source URL,
 reliability, rights status, a concrete rights basis, and explicit ML and
@@ -201,7 +214,8 @@ automatically queues entity resolution. Manual reruns are available through
 ## Corpus dashboard
 
 Open `http://localhost:8080/dashboard` for a read-only view of current corpus
-state. It shows the discovery funnel, canonical works, machine candidates,
+state. It shows the discovery and source-acquisition funnels, bibliographic
+candidate works, machine proof candidates,
 approved proofs, review queues, queue health and cumulative growth during the
 last year. The page refreshes every minute and does not expose source text.
 

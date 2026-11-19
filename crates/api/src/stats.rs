@@ -44,6 +44,12 @@ struct Overview {
     queued_jobs: i64,
     dead_letter_jobs: i64,
     coverage_runs: i64,
+    source_resolution_queued: i64,
+    source_resolution_running: i64,
+    source_resolution_resolved: i64,
+    source_resolution_rights_review: i64,
+    source_resolution_unavailable: i64,
+    source_resolution_failed: i64,
 }
 
 async fn load_overview(state: &AppState) -> Result<Overview, ApiError> {
@@ -71,7 +77,13 @@ async fn load_overview(state: &AppState) -> Result<Overview, ApiError> {
            (SELECT count(*) FROM entity_resolution_suggestions WHERE status = 'pending') AS entity_suggestions,
            (SELECT count(*) FROM jobs WHERE status IN ('queued', 'running', 'failed')) AS queued_jobs,
            (SELECT count(*) FROM jobs WHERE status = 'dead_letter') AS dead_letter_jobs,
-           (SELECT count(*) FROM coverage_runs) AS coverage_runs"#,
+           (SELECT count(*) FROM coverage_runs) AS coverage_runs,
+           (SELECT count(*) FROM source_resolution_queue WHERE status = 'queued') AS source_resolution_queued,
+           (SELECT count(*) FROM source_resolution_queue WHERE status = 'running') AS source_resolution_running,
+           (SELECT count(*) FROM source_resolution_queue WHERE status = 'resolved') AS source_resolution_resolved,
+           (SELECT count(*) FROM source_resolution_queue WHERE status = 'rights_review') AS source_resolution_rights_review,
+           (SELECT count(*) FROM source_resolution_queue WHERE status IN ('no_doi', 'no_open_source')) AS source_resolution_unavailable,
+           (SELECT count(*) FROM source_resolution_queue WHERE status = 'failed') AS source_resolution_failed"#,
     )
     .fetch_one(&state.db)
     .await?)
@@ -143,6 +155,18 @@ async fn metrics(State(state): State<AppState>) -> Result<impl IntoResponse, Api
         (
             "type_safety_history_jobs_dead_letter",
             counts.dead_letter_jobs,
+        ),
+        (
+            "type_safety_history_source_resolution_queued",
+            counts.source_resolution_queued,
+        ),
+        (
+            "type_safety_history_source_resolution_resolved",
+            counts.source_resolution_resolved,
+        ),
+        (
+            "type_safety_history_source_resolution_rights_review",
+            counts.source_resolution_rights_review,
         ),
     ];
     let body = values
@@ -296,7 +320,15 @@ th,td{{text-align:right;padding:8px 10px;border-bottom:1px solid var(--line)}} t
 <div class="stage"><span>Possible</span><strong>{possible}</strong></div>
 <div class="stage"><span>Unlikely</span><strong>{unlikely}</strong></div>
 <div class="stage"><span>Awaiting triage</span><strong>{untriaged}</strong></div>
-</div><p>Local ranking only; import and rejection remain curator decisions.</p></section>
+</div><p>Likely and possible records become unreviewed candidate works; proof claims still require evidence review.</p></section>
+<section class="panel"><h2>Source acquisition</h2><div class="funnel">
+<div class="stage"><span>Queued</span><strong>{source_queued}</strong></div>
+<div class="stage"><span>Running</span><strong>{source_running}</strong></div>
+<div class="stage"><span>Acquired</span><strong>{source_resolved}</strong></div>
+<div class="stage"><span>Rights review</span><strong>{source_rights}</strong></div>
+<div class="stage"><span>No automatic source</span><strong>{source_unavailable}</strong></div>
+<div class="stage"><span>Failed</span><strong>{source_failed}</strong></div>
+</div><p>Only explicitly licensed PDFs are acquired automatically.</p></section>
 <section class="panel"><h2>Corpus growth</h2>
 <div class="legend"><span><i class="dot" style="background:#285f8f"></i>Found</span><span><i class="dot" style="background:#39755a"></i>Works</span><span><i class="dot" style="background:#a66b19"></i>Proof results</span><span><i class="dot" style="background:#a64536"></i>Approval events</span></div>
 {chart}</section>
@@ -329,6 +361,12 @@ th,td{{text-align:right;padding:8px 10px;border-bottom:1px solid var(--line)}} t
         possible = counts.discovery_possible,
         unlikely = counts.discovery_unlikely,
         untriaged = counts.discovery_untriaged,
+        source_queued = counts.source_resolution_queued,
+        source_running = counts.source_resolution_running,
+        source_resolved = counts.source_resolution_resolved,
+        source_rights = counts.source_resolution_rights_review,
+        source_unavailable = counts.source_resolution_unavailable,
+        source_failed = counts.source_resolution_failed,
         duplicates = counts.duplicate_suggestions,
         entities = counts.entity_suggestions,
         citations = counts.approved_citations,
