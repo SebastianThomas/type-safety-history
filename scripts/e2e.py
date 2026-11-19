@@ -279,9 +279,22 @@ def main() -> None:
         },
         simple_pdf(f"Subject reduction is preservation. Retained run {suffix}."),
     )
-    wait_for(
+    retained_candidates = wait_for(
         "/api/v1/proof-results/candidates",
         lambda rows: any(row.get("work_id") == canonical["id"] for row in rows),
+    )
+    assert any(row["work_id"] == canonical["id"] for row in retained_candidates)
+    timeline = request("GET", "/api/v1/timeline?limit=200")
+    assert any(
+        row["work_id"] == canonical["id"]
+        and row["verification_status"] == "machine_classified"
+        for row in timeline
+    )
+    graph = request("GET", "/api/v1/graph")
+    assert graph["counts"]["proofs"] >= 1
+    assert any(
+        node["kind"] == "work" and node["id"] == f"work:{canonical['id']}"
+        for node in graph["nodes"]
     )
     overview = request("GET", "/api/v1/stats/overview")
     assert (
@@ -351,7 +364,15 @@ def main() -> None:
     assert "Research funnel" in dashboard and "Corpus growth" in dashboard
     status, content_type, portal = fetch_text("/curate")
     assert (
-        status == 200 and content_type == "text/html" and "Curator workspace" in portal
+        status == 200
+        and content_type == "text/html"
+        and "Optional review workspace" in portal
+    )
+    status, content_type, graph_page = fetch_text("/graph")
+    assert (
+        status == 200
+        and content_type == "text/html"
+        and "Proof history graph" in graph_page
     )
     status, _, api_document = fetch_text("/api/openapi.json")
     assert status == 200 and json.loads(api_document)["openapi"] == "3.1.0"
