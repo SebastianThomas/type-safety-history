@@ -1838,14 +1838,27 @@ struct PublicProof {
     content_sha256: Option<String>,
     evidence_paraphrase: Option<String>,
     obligations: Vec<String>,
+    evidence_pages: Vec<i32>,
+    evidence_count: i64,
 }
 
-async fn timeline(
-    State(state): State<AppState>,
-    Query(page): Query<Pagination>,
-) -> Result<Json<Vec<PublicProof>>, ApiError> {
-    let entries = sqlx::query_as::<_, PublicProof>(
-        "SELECT w.id AS work_id, w.title, w.publication_year, w.doi, \
+async fn load_public_proofs(
+    state: &AppState,
+    query: Option<&str>,
+    limit: i64,
+    offset: i64,
+) -> Result<Vec<PublicProof>, ApiError> {
+    Ok(sqlx::query_as::<_, PublicProof>(
+        "WITH representative AS ( \
+             SELECT DISTINCT ON (work_id, result_kind) id, work_id, theorem_name, \
+                    result_kind, proof_method, statement_summary, status, confidence, \
+                    classifier_version, source_document_id \
+             FROM proof_results \
+             WHERE status IN ('machine_candidate', 'curator_approved') \
+             ORDER BY work_id, result_kind, (status = 'curator_approved') DESC, \
+                      confidence DESC NULLS LAST, created_at, id \
+         ) \
+         SELECT w.id AS work_id, w.title, w.publication_year, w.doi, \
          pr.id AS proof_result_id, pr.theorem_name, pr.result_kind, pr.proof_method, \
          pr.statement_summary, \
          CASE WHEN pr.status = 'curator_approved' THEN 'curator_approved' \
@@ -1853,30 +1866,62 @@ async fn timeline(
          pr.confidence, pr.classifier_version, pr.source_document_id, \
          proof_evidence.page_start, proof_evidence.page_end, \
          proof_evidence.content_sha256, proof_evidence.paraphrase AS evidence_paraphrase, \
-         COALESCE((SELECT array_agg(po.obligation_kind ORDER BY po.obligation_kind) \
-                   FROM proof_obligations po WHERE po.proof_result_id = pr.id), \
-                  ARRAY[]::text[]) AS obligations \
-         FROM proof_results pr JOIN works w ON w.id = pr.work_id \
+         COALESCE(( \
+             SELECT array_agg(DISTINCT po.obligation_kind ORDER BY po.obligation_kind) \
+             FROM proof_results related_pr \
+             JOIN proof_obligations po ON po.proof_result_id = related_pr.id \
+             WHERE related_pr.work_id = pr.work_id \
+               AND related_pr.result_kind = pr.result_kind \
+               AND related_pr.status IN ('machine_candidate', 'curator_approved') \
+         ), ARRAY[]::text[]) AS obligations, \
+         COALESCE(( \
+             SELECT array_agg(DISTINCT ds.page_start ORDER BY ds.page_start) \
+             FROM proof_results related_pr \
+             JOIN evidence e ON e.proof_result_id = related_pr.id \
+             JOIN document_spans ds ON ds.id = e.document_span_id \
+             WHERE related_pr.work_id = pr.work_id \
+               AND related_pr.result_kind = pr.result_kind \
+               AND related_pr.status IN ('machine_candidate', 'curator_approved') \
+               AND ds.page_start IS NOT NULL \
+         ), ARRAY[]::integer[]) AS evidence_pages, \
+         (SELECT count(*) \
+          FROM proof_results related_pr \
+          JOIN evidence e ON e.proof_result_id = related_pr.id \
+          WHERE related_pr.work_id = pr.work_id \
+            AND related_pr.result_kind = pr.result_kind \
+            AND related_pr.status IN ('machine_candidate', 'curator_approved')) AS evidence_count \
+         FROM representative pr JOIN works w ON w.id = pr.work_id \
          LEFT JOIN LATERAL ( \
              SELECT ds.page_start, ds.page_end, ds.content_sha256, e.paraphrase \
              FROM evidence e JOIN document_spans ds ON ds.id = e.document_span_id \
              WHERE e.proof_result_id = pr.id \
              ORDER BY ds.page_start NULLS LAST, ds.char_start NULLS LAST LIMIT 1 \
          ) proof_evidence ON true \
-         WHERE pr.status IN ('machine_candidate', 'curator_approved') \
-         AND ($1::text IS NULL OR w.title ILIKE '%' || $1 || '%' \
+         WHERE ($1::text IS NULL OR w.title ILIKE '%' || $1 || '%' \
               OR w.doi ILIKE '%' || $1 || '%' OR pr.result_kind ILIKE '%' || $1 || '%') \
-         ORDER BY w.publication_year NULLS LAST, w.title, pr.id LIMIT $2 OFFSET $3",
+         ORDER BY w.publication_year NULLS LAST, w.title, pr.result_kind \
+         LIMIT $2 OFFSET $3",
     )
-    .bind(
+    .bind(query)
+    .bind(limit)
+    .bind(offset)
+    .fetch_all(&state.db)
+    .await?)
+}
+
+async fn timeline(
+    State(state): State<AppState>,
+    Query(page): Query<Pagination>,
+) -> Result<Json<Vec<PublicProof>>, ApiError> {
+    let entries = load_public_proofs(
+        &state,
         page.q
             .as_deref()
             .map(str::trim)
             .filter(|query| !query.is_empty()),
+        page.limit.clamp(1, 200),
+        page.offset.max(0),
     )
-    .bind(page.limit.clamp(1, 200))
-    .bind(page.offset.max(0))
-    .fetch_all(&state.db)
     .await?;
     Ok(Json(entries))
 }
@@ -1899,6 +1944,8 @@ struct GraphNode {
     page_end: Option<i32>,
     content_sha256: Option<String>,
     evidence_paraphrase: Option<String>,
+    evidence_pages: Option<Vec<i32>>,
+    evidence_count: Option<i64>,
 }
 
 #[derive(Serialize)]
@@ -1910,30 +1957,7 @@ struct GraphEdge {
 }
 
 async fn graph(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
-    let proofs = sqlx::query_as::<_, PublicProof>(
-        "SELECT w.id AS work_id, w.title, w.publication_year, w.doi, \
-         pr.id AS proof_result_id, pr.theorem_name, pr.result_kind, pr.proof_method, \
-         pr.statement_summary, \
-         CASE WHEN pr.status = 'curator_approved' THEN 'curator_approved' \
-              ELSE 'machine_classified' END AS verification_status, \
-         pr.confidence, pr.classifier_version, pr.source_document_id, \
-         proof_evidence.page_start, proof_evidence.page_end, \
-         proof_evidence.content_sha256, proof_evidence.paraphrase AS evidence_paraphrase, \
-         COALESCE((SELECT array_agg(po.obligation_kind ORDER BY po.obligation_kind) \
-                   FROM proof_obligations po WHERE po.proof_result_id = pr.id), \
-                  ARRAY[]::text[]) AS obligations \
-         FROM proof_results pr JOIN works w ON w.id = pr.work_id \
-         LEFT JOIN LATERAL ( \
-             SELECT ds.page_start, ds.page_end, ds.content_sha256, e.paraphrase \
-             FROM evidence e JOIN document_spans ds ON ds.id = e.document_span_id \
-             WHERE e.proof_result_id = pr.id \
-             ORDER BY ds.page_start NULLS LAST, ds.char_start NULLS LAST LIMIT 1 \
-         ) proof_evidence ON true \
-         WHERE pr.status IN ('machine_candidate', 'curator_approved') \
-         ORDER BY w.publication_year NULLS LAST, w.title, pr.id LIMIT 5000",
-    )
-    .fetch_all(&state.db)
-    .await?;
+    let proofs = load_public_proofs(&state, None, 5000, 0).await?;
 
     let mut nodes = Vec::new();
     let mut edges = Vec::new();
@@ -1960,6 +1984,8 @@ async fn graph(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
                 page_end: None,
                 content_sha256: None,
                 evidence_paraphrase: None,
+                evidence_pages: None,
+                evidence_count: None,
             });
         }
         nodes.push(GraphNode {
@@ -1982,6 +2008,8 @@ async fn graph(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
             page_end: proof.page_end,
             content_sha256: proof.content_sha256.clone(),
             evidence_paraphrase: proof.evidence_paraphrase.clone(),
+            evidence_pages: Some(proof.evidence_pages.clone()),
+            evidence_count: Some(proof.evidence_count),
         });
         edges.push(GraphEdge {
             source: work_id,
@@ -2009,6 +2037,8 @@ async fn graph(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
                     page_end: None,
                     content_sha256: None,
                     evidence_paraphrase: None,
+                    evidence_pages: None,
+                    evidence_count: None,
                 });
             }
             edges.push(GraphEdge {

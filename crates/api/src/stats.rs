@@ -15,6 +15,7 @@ pub(crate) fn router() -> Router<AppState> {
     Router::new()
         .route("/api/v1/stats/overview", get(overview))
         .route("/api/v1/stats/evolution", get(evolution))
+        .route("/api/v1/stats/proof-accumulation", get(proof_accumulation))
         .route("/metrics", get(metrics))
         .route("/dashboard", get(dashboard))
 }
@@ -66,8 +67,8 @@ async fn load_overview(state: &AppState) -> Result<Overview, ApiError> {
            (SELECT count(*) FROM discovery_candidates WHERE relevance_category = 'possible') AS discovery_possible,
            (SELECT count(*) FROM discovery_candidates WHERE relevance_category = 'unlikely') AS discovery_unlikely,
            (SELECT count(*) FROM discovery_candidates WHERE status = 'pending' AND triaged_at IS NULL) AS discovery_untriaged,
-           (SELECT count(*) FROM proof_results WHERE status IN ('machine_candidate', 'curator_approved')) AS proofs_published,
-           (SELECT count(*) FROM proof_results WHERE status = 'machine_candidate') AS proof_candidates,
+           (SELECT count(DISTINCT (work_id, result_kind)) FROM proof_results WHERE status IN ('machine_candidate', 'curator_approved')) AS proofs_published,
+           (SELECT count(DISTINCT (work_id, result_kind)) FROM proof_results WHERE status = 'machine_candidate') AS proof_candidates,
            (SELECT count(*) FROM proof_results WHERE status = 'curator_approved') AS proofs_approved,
            (SELECT count(*) FROM proof_results WHERE status = 'rejected') AS proofs_rejected,
            (SELECT count(*) FROM proof_results WHERE status = 'disputed') AS proofs_disputed,
@@ -260,6 +261,62 @@ async fn evolution(
         "days": days,
         "series": points,
         "note": "Discovery/work/proof/approval series are cumulative. Pending and queue series are durable minute-bucketed state snapshots."
+    })))
+}
+
+#[derive(Deserialize)]
+struct ProofAccumulationQuery {
+    #[serde(default = "default_granularity")]
+    granularity: String,
+}
+
+fn default_granularity() -> String {
+    "day".into()
+}
+
+#[derive(Debug, Serialize, FromRow)]
+struct ProofAccumulationPoint {
+    period: String,
+    added: i64,
+    cumulative: i64,
+}
+
+async fn proof_accumulation(
+    State(state): State<AppState>,
+    Query(query): Query<ProofAccumulationQuery>,
+) -> Result<Json<Value>, ApiError> {
+    let granularity = query.granularity.trim().to_ascii_lowercase();
+    if !matches!(granularity.as_str(), "day" | "month" | "year") {
+        return Err(ApiError::BadRequest(
+            "granularity must be day, month, or year".into(),
+        ));
+    }
+    let series = sqlx::query_as::<_, ProofAccumulationPoint>(
+        r#"WITH claims AS (
+              SELECT work_id, result_kind, min(created_at) AS first_seen
+              FROM proof_results
+              WHERE status IN ('machine_candidate', 'curator_approved')
+              GROUP BY work_id, result_kind
+           ), buckets AS (
+              SELECT date_trunc($1::text, first_seen) AS bucket, count(*) AS added
+              FROM claims GROUP BY bucket
+           )
+           SELECT CASE $1::text
+                    WHEN 'year' THEN to_char(bucket, 'YYYY')
+                    WHEN 'month' THEN to_char(bucket, 'YYYY-MM')
+                    ELSE to_char(bucket, 'YYYY-MM-DD')
+                  END AS period,
+                  added,
+                  sum(added) OVER (ORDER BY bucket)::bigint AS cumulative
+           FROM buckets ORDER BY bucket"#,
+    )
+    .bind(&granularity)
+    .fetch_all(&state.db)
+    .await?;
+    Ok(Json(json!({
+        "granularity": granularity,
+        "series": series,
+        "definition": "Unique paper/result-kind proof claims, accumulated by the date each claim first entered the corpus. Repeated page-level evidence is counted once."
     })))
 }
 

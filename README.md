@@ -226,6 +226,7 @@ The same data is available as JSON:
 
 - `GET /api/v1/stats/overview`
 - `GET /api/v1/stats/evolution?days=365`
+- `GET /api/v1/stats/proof-accumulation?granularity=day`
 
 Evolution includes cumulative discovery/research events and durable
 minute-bucketed snapshots of pending discovery, machine proof classifications
@@ -234,8 +235,11 @@ The overview remains authoritative for the current instant.
 
 `/graph` is the public work-to-proof-to-obligation view. Machine-classified
 proof assertions appear there immediately with confidence, classifier version,
-source document, page coordinates and evidence hash. Curator-confirmed results
-are visually distinct; confirmation is an optional provenance upgrade, not a
+source document, page coordinates and evidence hash. Repeated page-level
+matches are combined into one claim per paper and result kind while retaining
+the matched pages and evidence count. The page also plots new and cumulative
+unique claims with day, month and year grouping. Curator-confirmed results are
+visually distinct; confirmation is an optional provenance upgrade, not a
 publication gate.
 
 `/curate` is the optional authenticated browser workspace for proof, discovery,
@@ -262,9 +266,10 @@ work remains as an audited redirect tombstone.
 `GET /api/v1/timeline` returns machine-classified and curator-confirmed proof
 records. Every record exposes `verification_status`, local classifier
 provenance, confidence and source-evidence coordinates, so consumers can filter
-by assurance level. `GET /api/v1/graph` exposes the same publication set as
-work-to-proof-to-obligation nodes and edges. No manual action is required for a
-machine result to appear in either interface.
+by assurance level. Repeated page hits are aggregated into a single paper/result
+claim with `evidence_pages` and `evidence_count`. `GET /api/v1/graph` exposes the
+same publication set as work-to-proof-to-obligation nodes and edges. No manual
+action is required for a machine result to appear in either interface.
 
 Curators may still create a confirmed record from a primary-source document
 using `POST /api/v1/proof-results/curated`; exact page evidence, a paraphrase,
