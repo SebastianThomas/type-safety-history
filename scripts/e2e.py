@@ -296,9 +296,15 @@ def main() -> None:
         node["kind"] == "work" and node["id"] == f"work:{canonical['id']}"
         for node in graph["nodes"]
     )
-    accumulation = request("GET", "/api/v1/stats/proof-accumulation?granularity=day")
-    assert accumulation["series"]
-    assert accumulation["series"][-1]["cumulative"] == graph["counts"]["proofs"]
+    publication_history = request("GET", "/api/v1/stats/proof-publication-history")
+    assert publication_history["series"]
+    assert (
+        publication_history["series"][-1]["cumulative_proofs"]
+        <= graph["counts"]["proofs"]
+    )
+    assert (
+        publication_history["progress_preservation_anchor"]["publication_year"] == 1994
+    )
     overview = request("GET", "/api/v1/stats/overview")
     assert (
         overview["counts"]["documents_taken_down"]
@@ -376,7 +382,7 @@ def main() -> None:
         status == 200
         and content_type == "text/html"
         and "Proof history graph" in graph_page
-        and "Proof corpus accumulation" in graph_page
+        and "Proof publication history" in graph_page
     )
     status, _, api_document = fetch_text("/api/openapi.json")
     assert status == 200 and json.loads(api_document)["openapi"] == "3.1.0"

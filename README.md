@@ -226,7 +226,7 @@ The same data is available as JSON:
 
 - `GET /api/v1/stats/overview`
 - `GET /api/v1/stats/evolution?days=365`
-- `GET /api/v1/stats/proof-accumulation?granularity=day`
+- `GET /api/v1/stats/proof-publication-history`
 
 Evolution includes cumulative discovery/research events and durable
 minute-bucketed snapshots of pending discovery, machine proof classifications
@@ -237,10 +237,12 @@ The overview remains authoritative for the current instant.
 proof assertions appear there immediately with confidence, classifier version,
 source document, page coordinates and evidence hash. Repeated page-level
 matches are combined into one claim per paper and result kind while retaining
-the matched pages and evidence count. The page also plots new and cumulative
-unique claims with day, month and year grouping. Curator-confirmed results are
+the matched pages and evidence count. The page also plots annual and cumulative
+proof claims by paper publication year and marks the corpus's canonical 1994
+Wright–Felleisen progress/preservation anchor. Curator-confirmed results are
 visually distinct; confirmation is an optional provenance upgrade, not a
-publication gate.
+publication gate. Discovery currently records publication years, so the plot
+does not imply unsupported month/day precision.
 
 `/curate` is the optional authenticated browser workspace for proof, discovery,
 duplicate, entity and citation review, work inspection, saved searches, audit

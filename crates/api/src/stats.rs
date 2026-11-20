@@ -15,7 +15,10 @@ pub(crate) fn router() -> Router<AppState> {
     Router::new()
         .route("/api/v1/stats/overview", get(overview))
         .route("/api/v1/stats/evolution", get(evolution))
-        .route("/api/v1/stats/proof-accumulation", get(proof_accumulation))
+        .route(
+            "/api/v1/stats/proof-publication-history",
+            get(proof_publication_history),
+        )
         .route("/metrics", get(metrics))
         .route("/dashboard", get(dashboard))
 }
@@ -264,59 +267,83 @@ async fn evolution(
     })))
 }
 
-#[derive(Deserialize)]
-struct ProofAccumulationQuery {
-    #[serde(default = "default_granularity")]
-    granularity: String,
-}
-
-fn default_granularity() -> String {
-    "day".into()
+#[derive(Debug, Serialize, FromRow)]
+struct ProofPublicationPoint {
+    year: i32,
+    proofs_added: i64,
+    papers_added: i64,
+    cumulative_proofs: i64,
+    cumulative_papers: i64,
 }
 
 #[derive(Debug, Serialize, FromRow)]
-struct ProofAccumulationPoint {
-    period: String,
-    added: i64,
-    cumulative: i64,
+struct ProofHistoryMarker {
+    title: String,
+    publication_year: i32,
+    doi: Option<String>,
 }
 
-async fn proof_accumulation(
-    State(state): State<AppState>,
-    Query(query): Query<ProofAccumulationQuery>,
-) -> Result<Json<Value>, ApiError> {
-    let granularity = query.granularity.trim().to_ascii_lowercase();
-    if !matches!(granularity.as_str(), "day" | "month" | "year") {
-        return Err(ApiError::BadRequest(
-            "granularity must be day, month, or year".into(),
-        ));
-    }
-    let series = sqlx::query_as::<_, ProofAccumulationPoint>(
-        r#"WITH claims AS (
-              SELECT work_id, result_kind, min(created_at) AS first_seen
+async fn proof_publication_history(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
+    let marker = sqlx::query_as::<_, ProofHistoryMarker>(
+        r#"WITH work_kinds AS (
+              SELECT work_id,
+                     bool_or(result_kind = 'progress_and_preservation') AS combined,
+                     bool_or(result_kind = 'progress') AS progress,
+                     bool_or(result_kind = 'preservation') AS preservation
               FROM proof_results
               WHERE status IN ('machine_candidate', 'curator_approved')
-              GROUP BY work_id, result_kind
-           ), buckets AS (
-              SELECT date_trunc($1::text, first_seen) AS bucket, count(*) AS added
-              FROM claims GROUP BY bucket
+              GROUP BY work_id
            )
-           SELECT CASE $1::text
-                    WHEN 'year' THEN to_char(bucket, 'YYYY')
-                    WHEN 'month' THEN to_char(bucket, 'YYYY-MM')
-                    ELSE to_char(bucket, 'YYYY-MM-DD')
-                  END AS period,
-                  added,
-                  sum(added) OVER (ORDER BY bucket)::bigint AS cumulative
-           FROM buckets ORDER BY bucket"#,
+           SELECT w.title, w.publication_year, w.doi
+           FROM works w LEFT JOIN work_kinds kinds ON kinds.work_id = w.id
+           WHERE w.merged_into_work_id IS NULL AND w.publication_year IS NOT NULL
+             AND (w.doi = '10.1006/inco.1994.1093'
+                  OR kinds.combined OR (kinds.progress AND kinds.preservation))
+           ORDER BY (w.doi = '10.1006/inco.1994.1093') DESC,
+                    w.publication_year, w.title LIMIT 1"#,
     )
-    .bind(&granularity)
+    .fetch_optional(&state.db)
+    .await?;
+    let marker_year = marker.as_ref().map(|entry| entry.publication_year);
+    let series = sqlx::query_as::<_, ProofPublicationPoint>(
+        r#"WITH claims AS (
+              SELECT DISTINCT pr.work_id, pr.result_kind, w.publication_year
+              FROM proof_results pr JOIN works w ON w.id = pr.work_id
+              WHERE pr.status IN ('machine_candidate', 'curator_approved')
+                AND w.merged_into_work_id IS NULL
+                AND w.publication_year IS NOT NULL
+           ), buckets AS (
+              SELECT publication_year AS year, count(*) AS proofs_added,
+                     count(DISTINCT work_id) AS papers_added
+              FROM claims GROUP BY publication_year
+           ), bounds AS (
+              SELECT CASE WHEN min(year) IS NULL THEN $1::integer
+                          WHEN $1::integer IS NULL THEN min(year)
+                          ELSE least(min(year), $1::integer) END AS first_year,
+                     max(year) AS last_year
+              FROM buckets
+           ), years AS (
+              SELECT generate_series(first_year, last_year) AS year FROM bounds
+              WHERE first_year IS NOT NULL AND last_year IS NOT NULL
+           ), complete AS (
+              SELECT years.year, COALESCE(buckets.proofs_added, 0) AS proofs_added,
+                     COALESCE(buckets.papers_added, 0) AS papers_added
+              FROM years LEFT JOIN buckets USING (year)
+           )
+           SELECT year, proofs_added, papers_added,
+                  sum(proofs_added) OVER (ORDER BY year)::bigint AS cumulative_proofs,
+                  sum(papers_added) OVER (ORDER BY year)::bigint AS cumulative_papers
+           FROM complete ORDER BY year"#,
+    )
+    .bind(marker_year)
     .fetch_all(&state.db)
     .await?;
     Ok(Json(json!({
-        "granularity": granularity,
         "series": series,
-        "definition": "Unique paper/result-kind proof claims, accumulated by the date each claim first entered the corpus. Repeated page-level evidence is counted once."
+        "progress_preservation_anchor": marker,
+        "date_precision": "year",
+        "definition": "Unique paper/result-kind proof claims grouped by the paper's publication year. Repeated page-level evidence is counted once.",
+        "anchor_note": "The marker identifies the corpus's canonical syntactic progress/preservation anchor; it is not an unqualified claim of universal historical priority."
     })))
 }
 
