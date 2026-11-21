@@ -1540,6 +1540,9 @@ async fn find_work_by_doi(state: &AppState, doi: &str) -> Result<Option<Work>, A
 struct ProofCandidate {
     id: Uuid,
     work_id: Uuid,
+    work_title: String,
+    publication_year: Option<i32>,
+    doi: Option<String>,
     theorem_name: Option<String>,
     result_kind: String,
     proof_method: Option<String>,
@@ -1556,12 +1559,16 @@ async fn list_candidates(
 ) -> Result<Json<Vec<ProofCandidate>>, ApiError> {
     require_viewer(&state, &headers).await?;
     let candidates = sqlx::query_as::<_, ProofCandidate>(
-        "SELECT id, work_id, theorem_name, result_kind, proof_method, statement_summary, \
-         confidence, classifier_version, created_at::text AS created_at \
-         FROM proof_results WHERE status = 'machine_candidate' \
-         AND ($1::text IS NULL OR result_kind ILIKE '%' || $1 || '%' \
-              OR statement_summary ILIKE '%' || $1 || '%') \
-         ORDER BY created_at LIMIT $2 OFFSET $3",
+        "SELECT result.id, result.work_id, work.title AS work_title, \
+         work.publication_year, work.doi, result.theorem_name, result.result_kind, \
+         result.proof_method, result.statement_summary, result.confidence, \
+         result.classifier_version, result.created_at::text AS created_at \
+         FROM proof_results result JOIN works work ON work.id = result.work_id \
+         WHERE result.status = 'machine_candidate' \
+         AND ($1::text IS NULL OR result.result_kind ILIKE '%' || $1 || '%' \
+              OR result.statement_summary ILIKE '%' || $1 || '%' \
+              OR work.title ILIKE '%' || $1 || '%' OR work.doi ILIKE '%' || $1 || '%') \
+         ORDER BY result.created_at LIMIT $2 OFFSET $3",
     )
     .bind(
         page.q

@@ -228,6 +228,7 @@ def main() -> None:
         "progress_and_preservation",
         "type_soundness",
     }
+    assert all(row["work_title"] and row["doi"] for row in candidates)
     assert request("GET", "/api/v1/proof-results/candidates", token=viewer_token)
     assert (
         request_status(

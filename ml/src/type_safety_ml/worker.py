@@ -31,12 +31,12 @@ from sklearn.preprocessing import normalize
 
 LOG = logging.getLogger("type_safety_ml.worker")
 LEASE_SECONDS = 300
-PIPELINE_VERSION = "local-term-baseline-v1"
+PIPELINE_VERSION = "local-term-context-v2"
 EMBEDDING_ALGORITHM = "sklearn-hashing-word-1-2-v1"
 EMBEDDING_DIMENSIONS = 512
 MAX_CANDIDATES_PER_DOCUMENT = 25
 DOI_PATTERN = re.compile(r"\b10\.\d{4,9}/[-._;()/:A-Z0-9]+", re.IGNORECASE)
-DISCOVERY_TRIAGE_VERSION = "local-tfidf-hybrid-v1"
+DISCOVERY_TRIAGE_VERSION = "local-tfidf-hybrid-v2"
 
 DISCOVERY_STRONG_PHRASES = (
     "type soundness",
@@ -74,6 +74,13 @@ DISCOVERY_NEGATIVE_TERMS = (
     "fire safety",
     "water safety",
     "safety management",
+    "coastal wetland",
+    "wetland preservation",
+    "ecosystem preservation",
+    "biodiversity preservation",
+    "heritage preservation",
+    "historic preservation",
+    "food preservation",
 )
 DISCOVERY_POSITIVE_PROTOTYPES = (
     "A syntactic approach to type soundness",
@@ -92,6 +99,31 @@ DISCOVERY_NEGATIVE_PROTOTYPES = (
     "Aviation safety management systems",
     "Soundness examination in animal breeding",
     "Syntactic processing in human linguistics",
+    "Coastal wetland preservation progress and biodiversity conservation",
+    "Progress in food preservation technology",
+)
+
+TYPE_SAFETY_CONTEXT_TERMS = (
+    "type soundness",
+    "type safety",
+    "type system",
+    "type systems",
+    "type checker",
+    "typed language",
+    "typed calculus",
+    "typed lambda",
+    "lambda calculus",
+    "programming language",
+    "operational semantics",
+    "static semantics",
+    "typing judgment",
+    "typing judgement",
+    "typing derivation",
+    "well-typed",
+    "well typed",
+    "subject reduction",
+    "semantic soundness",
+    "type polymorphism",
 )
 
 
@@ -129,10 +161,13 @@ def score_discovery_candidate(title: str, query_texts: list[str]) -> tuple[float
     """Rank metadata locally without changing a candidate's review status."""
     text = " ".join([title, *query_texts]).lower().replace("–", "-").replace("—", "-")
     title_text = title.lower().replace("–", "-").replace("—", "-")
+    has_domain_context = any(term in title_text for term in TYPE_SAFETY_CONTEXT_TERMS)
     score = 0.0
-    score += min(0.7, 0.55 * sum(phrase in title_text for phrase in DISCOVERY_STRONG_PHRASES))
+    strong_matches = sum(phrase in title_text for phrase in DISCOVERY_STRONG_PHRASES)
+    if has_domain_context:
+        score += min(0.7, 0.55 * strong_matches)
     score += min(0.3, 0.15 * sum(term in title_text for term in DISCOVERY_CONTEXT_TERMS))
-    if "progress" in title_text and "preservation" in title_text:
+    if has_domain_context and "progress" in title_text and "preservation" in title_text:
         score += 0.45
     if "soundness" in title_text and ("type" in title_text or "typed" in title_text):
         score += 0.4
@@ -143,7 +178,7 @@ def score_discovery_candidate(title: str, query_texts: list[str]) -> tuple[float
     if any(term in title_text for term in DISCOVERY_NEGATIVE_TERMS):
         score -= 0.75
     # A matching discovery query is weak evidence; it must never make a generic title likely.
-    if any(phrase in text for phrase in DISCOVERY_STRONG_PHRASES):
+    if has_domain_context and any(phrase in text for phrase in DISCOVERY_STRONG_PHRASES):
         score += 0.08
     score = round(min(1.0, max(0.0, score)), 4)
     if score >= 0.7:
@@ -174,13 +209,15 @@ def classify_discovery_candidates(
     classified = []
     for index, candidate in enumerate(candidates):
         lexical_score, _ = score_discovery_candidate(candidate["title"], candidate["query_texts"])
+        title_text = candidate["title"].lower().replace("–", "-").replace("—", "-")
+        has_domain_context = any(term in title_text for term in TYPE_SAFETY_CONTEXT_TERMS)
         score = round(
             min(
                 1.0,
                 max(
                     0.0,
                     lexical_score * 0.72
-                    + float(positive_scores[index]) * 0.5
+                    + float(positive_scores[index]) * (0.5 if has_domain_context else 0.12)
                     - float(negative_scores[index]) * 0.4,
                 ),
             ),
@@ -534,20 +571,25 @@ def extract_citation_candidates(pages: list[dict[str, Any]]) -> list[CitationCan
 
 def classify_pages(document_id: UUID, pages: list[dict[str, Any]]) -> list[Candidate]:
     candidates: list[Candidate] = []
+    document_text = "\n".join(str(page["text"]).casefold() for page in pages)
+    document_has_context = any(term in document_text for term in TYPE_SAFETY_CONTEXT_TERMS)
     patterns = (
-        ("progress_and_preservation", ("progress", "preservation"), 0.92),
-        ("preservation", ("subject reduction",), 0.88),
-        ("type_soundness", ("type soundness",), 0.86),
-        ("type_soundness", ("well-typed", "go wrong"), 0.84),
-        ("preservation", ("preservation",), 0.72),
-        ("progress", ("progress",), 0.70),
+        ("progress_and_preservation", ("progress", "preservation"), 0.92, True),
+        ("preservation", ("subject reduction",), 0.88, False),
+        ("type_soundness", ("type soundness",), 0.86, False),
+        ("type_soundness", ("well-typed", "go wrong"), 0.84, False),
+        ("preservation", ("preservation",), 0.72, True),
+        ("progress", ("progress",), 0.70, True),
     )
     for page in pages:
         text = str(page["text"])
         lowered = text.casefold()
+        page_has_context = any(term in lowered for term in TYPE_SAFETY_CONTEXT_TERMS)
         emitted: set[str] = set()
-        for result_kind, terms, confidence in patterns:
+        for result_kind, terms, confidence, requires_context in patterns:
             if result_kind in emitted or not all(term in lowered for term in terms):
+                continue
+            if requires_context and not (page_has_context or document_has_context):
                 continue
             offsets = [lowered.index(term) for term in terms]
             char_start = min(offsets)
@@ -1305,6 +1347,40 @@ def persist_generic_job_success(
         )
 
 
+def queue_pipeline_upgrade(connection: psycopg.Connection[Any]) -> int:
+    """Queue each active document once when its recorded extraction predates this pipeline."""
+    with connection.transaction(), connection.cursor() as cursor:
+        cursor.execute(
+            """
+            INSERT INTO jobs (job_type, idempotency_key, payload)
+            SELECT 'extract_document',
+                   'extract:' || document.id::text || ':' || document.sha256 || ':' || %s::text,
+                   jsonb_build_object(
+                       'document_id', document.id,
+                       'object_key', document.object_key,
+                       'pipeline_version', %s::text
+                   )
+            FROM documents document
+            WHERE document.status = 'active' AND document.ml_use_permitted = true
+              AND NOT EXISTS (
+                  SELECT 1 FROM document_embeddings embedding
+                  JOIN pipeline_runs run ON run.id = embedding.pipeline_run_id
+                  WHERE embedding.document_id = document.id
+                    AND run.pipeline_version = %s::text
+              )
+              AND NOT EXISTS (
+                  SELECT 1 FROM jobs pending
+                  WHERE pending.job_type = 'extract_document'
+                    AND pending.status IN ('queued', 'running', 'failed')
+                    AND pending.payload->>'document_id' = document.id::text
+              )
+            ON CONFLICT (idempotency_key) DO NOTHING
+            """,
+            (PIPELINE_VERSION, PIPELINE_VERSION, PIPELINE_VERSION),
+        )
+        return cursor.rowcount
+
+
 def run() -> None:
     database_url = os.environ["DATABASE_URL"]
     data_root = Path(os.getenv("DATA_ROOT", "/data"))
@@ -1316,6 +1392,13 @@ def run() -> None:
     while True:
         try:
             with psycopg.connect(database_url, autocommit=False) as connection:
+                queued_upgrades = queue_pipeline_upgrade(connection)
+                if queued_upgrades:
+                    LOG.info(
+                        "queued documents for pipeline upgrade: version=%s documents=%s",
+                        PIPELINE_VERSION,
+                        queued_upgrades,
+                    )
                 while True:
                     job = claim_job(connection, worker_id)
                     if job is None:

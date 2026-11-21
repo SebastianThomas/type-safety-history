@@ -48,6 +48,22 @@ def test_classification_is_conservative_and_idempotent() -> None:
     ]
 
 
+def test_classification_rejects_ecological_progress_and_preservation() -> None:
+    candidates = classify_pages(
+        UUID("00000000-0000-0000-0000-000000000003"),
+        [
+            {
+                "page": 1,
+                "text": (
+                    "Coastal wetlands of the north of Peru: preservation progress "
+                    "and biodiversity conservation in a changing ecosystem."
+                ),
+            }
+        ],
+    )
+    assert candidates == []
+
+
 def test_embeddings_are_local_deterministic_zarr(tmp_path: Path) -> None:
     document_id = UUID("00000000-0000-0000-0000-000000000002")
     pages = [
@@ -92,6 +108,19 @@ def test_discovery_triage_demotes_unrelated_safety_results() -> None:
             {
                 "title": "Food safety management in regional restaurants",
                 "query_texts": ["type safety programming language"],
+            }
+        ]
+    )[0]
+    assert score < 0.25
+    assert category == "unlikely"
+
+
+def test_discovery_triage_rejects_coastal_wetland_preservation_progress() -> None:
+    score, category = classify_discovery_candidates(
+        [
+            {
+                "title": "Coastal wetlands of the north of Peru: preservation progress",
+                "query_texts": ["progress preservation type system"],
             }
         ]
     )[0]

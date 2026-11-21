@@ -128,13 +128,21 @@ notices shipped with its PDFium wheel). Library versions, algorithms and
 licences are recorded with pipeline output. Runtime ML does not need outbound network access.
 Documents whose terms do not permit local ML are excluded from jobs.
 
-The initial `local-term-baseline-v1` pipeline is deliberately deterministic and
-conservative. It detects terminology associated with progress, preservation,
-subject reduction and type soundness, records only page/character coordinates
-and a paraphrase in PostgreSQL, and leaves every result in `machine_candidate`.
+The current `local-term-context-v2` pipeline is deterministic and requires
+programming-language/type-system context before bare “progress” or
+“preservation” matches can become proof candidates. Strong phrases such as
+“type soundness”, “subject reduction”, and “well-typed programs do not go
+wrong” remain direct signals. The pipeline records page/character coordinates
+and a paraphrase in PostgreSQL and leaves every result in `machine_candidate`.
 Those results are published as explicitly labelled `machine_classified`
 assertions. They are a discovery aid, not evidence that a theorem actually
 appears or is valid; optional review can upgrade them to `curator_approved`.
+
+Migration `0014_contextual_proof_classification.sql` retires results produced by
+the context-free v1 classifier. The v2 worker idempotently queues every active,
+ML-permitted document whose recorded embedding still belongs to an older
+pipeline, so false positives disappear and valid documents are reclassified
+without manual intervention.
 
 Embedded PDF text is preferred. Tesseract is used only as a local fallback for
 pages with little embedded text, and OCR usage is recorded per document. DOI
